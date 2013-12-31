@@ -20,6 +20,50 @@
 #include<linux/pagemap.h>
 //kmap,kunmap
 #include<linux/highmem.h>
+//sleep_on_timeout
+#include<linux/wait.h>
+
+//2013-12-31修改了地址记录的结构，因为一页内的偏移不超过4100,所以没必要使用long表示，在压缩下段和页索引，使用4字节表示一个地址记录：
+//前两字节表示段序号和页序号，段只搜索代码段和数据段，所以只用一位表示即可，剩下7位表示页索引，每个段的页索引规定最大：30000,也就是
+//每个段搜索的最大地址为：120M，全部搜索为240M。应对一般的搜索足够了，如果需要更大的搜索空间可重新定义下列结构：
+struct SEG_DESC
+{
+	unsigned short pbit:15;			//页占15位
+	unsigned short sbit:1;			//段占1位，=0表示代码段，=1数据段。
+};
+struct KVAR_SAD
+{
+	union{
+		struct SEG_DESC s_b;
+		unsigned short  spg;
+	};
+	union{
+		unsigned short off;
+		unsigned char  ofch[2];
+	};
+};//现在的结构一次可传送2000地址。
+struct KVAR_ADDR
+{
+	unsigned int maxd;			//上限
+	unsigned int mind;			//下限
+	struct KVAR_SAD;			//地址结构
+	unsigned char vv0[4];		//无用，使结构为16字节
+};
+
+/*
+struct KVAR_SAD
+{
+	unsigned char seg;
+	unsigned char vv0;
+	union{
+	unsigned char page[2];			//由此也限制了页数最大为0xffff
+	unsigned short pg;
+	};
+	union{
+	unsigned int  offset;			//偏移
+	char offch[4];
+	};
+};
 struct KVAR_ADDR
 {
 	unsigned int	maxd;			//上限
@@ -36,8 +80,8 @@ struct KVAR_ADDR
 	unsigned int   pin;				//页内偏移
 	unsigned char  inch[4];
 	};
-};
-struct KAVR_AM
+};*/
+struct KVAR_AM
 {
 	unsigned char sync;					//命令字段中0字节的同步标志，
 	unsigned char cmd;					//命令字段中1字节的主命令标志
@@ -47,7 +91,7 @@ struct KAVR_AM
 	};
 	unsigned char proc;					//命令字段中的6字节，存放进度值1-100
 	unsigned char end0;					//命令字段中的7字节，存放本次查询的结束标志，=1结束
-	char vv0[2];						//命令字段中的8,9字节，暂时未用。
+	char vv0[2];						//命令字段中的8,9字节，暂时未用。再次查询时在副本中用到8字节=3表示有效。
 	union{
 	unsigned long snum;					//命令字段中的10字节起的查询关键字。
 	unsigned char sch[4];
@@ -69,13 +113,13 @@ struct KVAR_TY
 	int		thread_lock;			//进程运行锁标志。
 	unsigned char flag;//=0只允许传送pid,=1只允许首次查询和传送pid。=2全部操作允许。传送pid时该字节置1,首次查询时该字节置2。
 	int		 pid;
-	union{
+	union{//带查询的数字
 		unsigned char  dest[4];
 		int	dnum;
 	};
 //下面两项保存段起始地址和页序号。
 	unsigned long  seg[2];//0:代码段，1：数据段
-	unsigned short pin;//暂时保存，准备往buffer中写入		
+	unsigned short pin;//-2013-12-31改为缓冲区设置标志 暂时保存，准备往buffer中写入		=3时输入输出缓冲区为tp,!=3时缓冲区的mp
 };
 
 MODULE_LICENSE("GPL");
@@ -125,19 +169,23 @@ char *mp,*tp;
 struct class *mem_class;
 unsigned char suc=0;
 struct KVAR_TY kv1;
-struct KVAR_AM k_am;//和命令头对应的结构
+struct KVAR_AM k_am;
+//和命令头对应的结构
 
 static int __init reg_init(void);
 static void __exit reg_exit(void);
 static int mem_open(struct inode *ind,struct file *filp);
 static int mem_release(struct inode *ind,struct file *filp);
 static ssize_t mem_read(struct file *filp,char __user *buf,size_t size,loff_t *fpos);
-static ssize_t mem_write(struct file *filp,char __user *buf,size_t size,loff_t *fpos);
+static ssize_t mem_write(struct file *filp,const char __user *buf,size_t size,loff_t *fpos);
 static void class_create_release(struct class *cls);
-//命令分析函数
-static int anly_cmd(void);
 //首次查询的线程函数
 int first_srh(void *argc);
+int next_srh(void *argc);//再次查找的线程函数
+//一个统一的同步设置及阻塞函数。
+void s_sync(int t);
+//等待函数。
+void s_wait_mm(int w);
 
 struct file_operations mem_fops=
 {
@@ -189,11 +237,13 @@ int __init reg_init(void)
 	}
 	device_create(mem_class,NULL,devno,NULL,drv_name);//注册设备文件系统，并建立节点。
 	printk("<1>device create success!!!\n");
+	kv1.pin=1;
 	return 0;
 reg_err02:
 	unregister_chrdev(DRV_MAJOR,drv_name);//删除字符设备
 reg_err01:
 	kfree(mp);
+	vfree(tp);
 	suc=1;
 	return -1;
 }//}}}
@@ -208,6 +258,8 @@ void __exit reg_exit(void)
 		class_unregister(mem_class);
 	if(mp!=NULL)
 		kfree(mp);
+	if(tp!=NULL)
+		vfree(tp);
 	printk("<1>module exit ok!\n");
 }//}}}
 //{{{ int mem_open(struct inode *ind,struct file *filp)
@@ -229,22 +281,28 @@ ssize_t mem_read(struct file *filp,char *buf,size_t size,loff_t *fpos)
 {
 	int res;
 	char *tmp;
-	if(mp==NULL)
+	if(mp==NULL || tp==NULL)
 	{
 		printk("<1>kernel buffer error!\n");
 		return 0;
 	}
-	if(mp[0]==0)
+	switch(kv1.pin)
 	{
-		tmp=(char*)&k_am;
-		size=sizeof(k_am);
-	}
-	else
-	{
+	case 0://轮寻时的缓冲
+		return 0;
+	case 1://首次查询(命令和结果在mp中)和再次查询用户向内核传送地址时(此时的命令字节都在mp中)
 		tmp=mp;
 		if(size>K_BUFFER_SIZE)
 			size=K_BUFFER_SIZE;
-	}
+		break;
+	case 2://再次查询时输出结果
+		tmp=tp;
+		if(size>K_BUFFER_SIZE)
+			size=K_BUFFER_SIZE;
+		break;
+	default://其他时:首次查询输出结果，再次查询时请求地址。
+		return 0;
+	};
 	res=copy_to_user(buf,tmp,size);
 	if(res==0)
 	{
@@ -255,142 +313,108 @@ ssize_t mem_read(struct file *filp,char *buf,size_t size,loff_t *fpos)
 	return 0;
 }//}}}
 //{{{ ssize_t mem_write(struct file *filp,char *buf,size_t size,loff_t *fpos)
-ssize_t mem_write(struct file *filp,char *buf,size_t size,loff_t *fpos)
+ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 {
-	int i,j,res;
+	int res;
 	char *tmp;
-	if(mp==NULL)
+	if(mp==NULL ||tp==NULL)
 	{
 		printk("<1>kernel buffer error!\n");
 		return 0;
 	}
-	tmp=mp;
-	if(size>sizeof(k_am))
-		size=sizeof(k_am);
+	switch(kv1.pin)
+	{
+	case 0://待命状态时默认不读取(不接受用户任何指令)，直接返回
+		return 0;
+	case 1://使用mp,此时等待接收首次查询时用户的反馈信息，和再次查询时取得地址。
+		tmp=mp;
+		if(size>K_BUFFER_SIZE)
+			size=K_BUFFER_SIZE;
+		break;
+	case 2://再次查询时传送出查询结果后等待用户的相应信息
+		tmp=tp;
+		if(size>K_BUFFER_SIZE)
+			size=K_BUFFER_SIZE;
+		break;
+	default:
+		return 0;
+	};
 	res=copy_from_user(tmp,buf,size);
 	if(res==0)
 	{
+		if(tmp[0]!=0)
+			return size;
 //		printk("<1>copy data from u->k success!\n");
-//		i=0;j=0;//这里要插入命令分析函数。
-		if(kv1.thread_lock==0)
+		if(kv1.thread_lock==0)//命令分析，仅在没有线程运行时才有效。
 		{//需要启动内核线程,根据tmp[0]确定启动哪个线程：
 			memset((void*)&k_am,0,sizeof(k_am));
-			memcpy((void*)&k_am,tmp,size);//拷贝至结构，平时的操作只在结构中进行。
+			memcpy((void*)&k_am,tmp,sizeof(k_am));//拷贝至结构，平时的操作只在结构中进行。
 //为了保险，一些标志再次强制设置：
-			k_am.sync=0;k_am.end0=0;			
-			memset((void*)&tmp[d_begin],0,d_len);//清空数据缓冲区
-			if(tmp[1]==0)
-			{
-				kv1.pid=k_am.pid;//命令字0的主要任务就是取得pid
-				return size;	
-			}
+			k_am.sync=0;k_am.end0=0;
+			kv1.pid=k_am.pid;kv1.dnum=k_am.snum;
 			if(tmp[1]==1)//首次查找。
 			{
-				kv1.thread_lock=1;
+				tmp[0]=0;tmp[7]=0;tmp[8]=0;
+				kv1.thread_lock=1;s_sync(0);
 				kernel_thread(first_srh,NULL,CLONE_KERNEL);//启动首次查找线程.
 				return size;
 			}
 			if(tmp[1]==2)//再次查询
-			{
-				kv1.thread_lock=1;
+			{//确定采用一个线程完成全部再次查询的操作。因此下面的一步是必须的：
+				tmp[0]=0;tmp[7]=0;tmp[8]=0;
+				kv1.pin=0;kv1.thread_lock=1;
 				kernel_thread(next_srh,NULL,CLONE_KERNEL);//启动再次查询线程
 				return size;
 			}
 			//下面还有修改，读取整页等操作。
 		}
 		else
-		{//此时线程已启动，本次操作仅是表示用户已经拷贝完数据，可以继续线程的查询操作
-		//注意：此时tmp[0]必须是0,该操作应该是由用户设置。	
+		{//此时线程已启动，本次操作仅是表示用户已经拷贝完数据（选择每1000地址启动一个线程是这样），可以继续线程的查询操作
+		//注意：此时tmp[0]必须是0,该操作应该是由用户设置。另外，在进行再次查找时，每次传送的
+		//数据都是有效的，并且如果线程如果启动了，在这应该保存传入的地址。--这实际上是使用一个线程
+		//完成全部本次查找还是每查找1000个地址启动一个新线程的选择。每次启动新线程无疑处理起来简单.
+		//但是考虑到效率的话，这种单线程方式应该更加有效。	
 			return size;
 		}
 	}
 	return 0;
 }//}}}
-//{{{ int anly_cmd(void)--2013-12-29 该函数彻底失效，其功能由mem_write函数中的代码实现
-int anly_cmd(void)
-{
-	int i;
-	i=(int)mp[1];
-	switch(i)
-	{
-	case 0://初次同步，传送pid
-		kv1.pid=0;
-		memcpy((void*)&kv1.pid,(void*)&mp[2],2);//得到目标进程的pid
-		kv1.flag=1;
-		mp[0]=1;//本次操作完成，允许用户再进行新的指令
-		break;
-	case 1://首次查询，
-		if(kv1.pid==0)//操作越位
-		{
-			printk("<1>trans pid error!\n");
-			return 1;
-		}
-		memcpy(kv1.dest,(void*)&mp[10],4);//得到待查数据
-		kv1.flag=2;
-		//这里调用查询函数，开始查询。当查询的地址数量=1000时，查询函数挂起，将mp[0]置位，等待用户将地址拷贝完成后继续进行。
-		break;
-	case 2://再次查询
-		if(kv1.flag!=2)
-		{
-			printk("<1>searching error!\n");
-			return 1;
-		}
-		memcpy(kv1.dest,(void*)&mp[10],4);//得到再次查询的数据
-		//这里调用再次查询函数，
-		break;
-	case 3://整页传送
-		if(kv1.flag!=2)
-		{
-			printk("<1>searching error!\n");
-			return 1;
-		}
-		memcpy(kv1.dest,(void*)&mp[10],4);//得到地址，传送该地址所在页的全部数据。
-		//这里调用数据传送函数
-		break;
-	};
-	return 0;
-}//}}}
 //{{{ int first_srh(void)
 int first_srh(void *argc)
 {
-	char *c,*mc;
+	char *c,*mc,*v;
 	int ret,len,i,j,k,m,n;
 	struct pid *kpid;
 	struct task_struct *t_str;
 	struct mm_struct *mm_str;
 	struct vm_area_struct *vadr;
-	struct page **pages,*pg;
+	struct page **pages;
 	unsigned long adr,sadr;
-	wait_queue_head_t whead;
-	wait_queue_t	wdata;
-	pg=NULL;
+	struct KVAR_SAD ksa;
+	v=NULL;
 	memset((void*)&mp[d_begin],0,d_len);
 	mc=&mp[d_begin];
-	//sleep_on_time函数的准备
-	init_waitqueue_head(&whead);
-	initwaitqueue_entry(&wdata,current);
-	add_wait_queue(&whead,&wdata);
 	kpid=find_get_pid(kv1.pid);
 	if(kpid==NULL)
 	{
 		printk("<1>find_get_pid error!\n");
-		return 1;
+		goto ferr_01;
 	}
 	t_str=pid_task(kpid,PIDTYPE_PID);
 	if(t_str==NULL)
 	{
 		printk("<1>pid_task error!\n");
-		return 1;
+		goto ferr_01;
 	}
 	mm_str=get_task_mm(t_str);
 	if(mm_str==NULL)
 	{
 		printk("<1>get_task_mm error!\n");
-		return 1;
+		goto ferr_01;
 	}
 	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
-	kv1.seg[0]=mm_str->start_text;
-	kv1.seg[1]=mm_str->end_text;
+	kv1.seg[0]=mm_str->start_code;
+	kv1.seg[1]=mm_str->end_code;
 	n=0;
 	for(m=0;m<2;m++)
 	{//段的循环，只查询代码段和数据段。
@@ -398,18 +422,20 @@ int first_srh(void *argc)
 			vadr=mm_str->mmap;
 		else
 			vadr=mm_str->mmap->vm_next;
+		adr=vadr->vm_start;
 		len=vma_pages(vadr);//取得页数量
-		if(pg==NULL)
+		if(v==NULL)
 		{
-			pg=(struct page *)vmalloc(sizeof(void*)*(len+1));//分配足够数量的空间，保存页地址。
-			if(pg==NULL)
+			v=(char *)vmalloc(sizeof(void*)*(len+1));
+			pages=(struct page **)v;//这样做的目的是防止vfree释放时差生误解
+			//pages=(struct page **)vmalloc(sizeof(void*)*(len+1));//分配足够数量的空间，保存页地址。
+			if(pages==NULL)
 			{
 				printk("<1>vmalloc error11\n");
-				return 1;
+				goto ferr_01;
 			}
 		}
-		memset((void*)&pg,0,sizeof(sizeof(void*)*(len+1)));
-		pages=&pg;
+		memset((void*)pages,0,sizeof(void*)*(len+1));
 		down_write(&mm_str->mmap_sem);
 		ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
 		if(ret>0)
@@ -421,6 +447,11 @@ int first_srh(void *argc)
 					printk("<1>search finished\n");
 					break; //查找完成
 				}
+				if(k>30000)
+				{
+					printk("<1>max saved pages=30000\n");
+					break;
+				}
 				c=(char*)kmap(pages[k]);
 				if(kv1.dnum<256)//按字节查询
 				{
@@ -428,22 +459,15 @@ int first_srh(void *argc)
 					{
 						if(c[j]==kv1.dest[0])
 						{
-							mc[0]=(char)m;//段的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&k,2);//页的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&j,sizeof(void*));//页内偏移。
-							mc+=4;
-							if(mc-mp[d_begin]<8)//写满一页，需要往用户空间传送了
+							memset((vooid*)&ksa,0,sizeof(ksa));
+							ksa.s_b.sbit=(unsigned short)m;
+							ksa.s_b.pbit=(unsigned short)k;
+							ksa.off=(unsigned short)j;
+							memcpy((void*)mc,(void*)&ksa,sizeof(ksa));
+							mc+=4;//2013-12-31改为4字节长度。
+							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
-								mp[0]=1;//调用休眠，循环查询mp[0]==0等待。
-								k_am.sync=1;
-								while(1)
-								{
-									if(mp[0]==0)
-										break;
-									sleep_on_timeout(&whead,200);
-								}
+								s_sync(1);//阻塞在此
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -457,22 +481,15 @@ int first_srh(void *argc)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]))
 						{
-							mc[0]=(char)m;//段的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&k,2);//页的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&j,sizeof(void*));//页内偏移。
-							mc+=4;
-							if(mc-mp[d_begin]<8)//写满一页，需要往用户空间传送了
+							memset((vooid*)&ksa,0,sizeof(ksa));
+							ksa.s_b.sbit=(unsigned short)m;
+							ksa.s_b.pbit=(unsigned short)k;
+							ksa.off=(unsigned short)j;
+							memcpy((void*)mc,(void*)&ksa,sizeof(ksa));
+							mc+=4;//2013-12-31改为4字节长度。
+							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
-								mp[0]=1;//调用休眠，循环查询mp[0]==0等待。
-								k_am.sync=1;
-								while(1)
-								{
-									if(mp[0]==0)
-										break;
-									sleep_on_timeout(&whead,200);
-								}
+								s_sync(1);//阻塞在此
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -486,22 +503,15 @@ int first_srh(void *argc)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]))
 						{
-							mc[0]=(char)m;//段的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&k,2);//页的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&j,sizeof(void*));//页内偏移。
-							mc+=4;
-							if(mc-mp[d_begin]<8)//写满一页，需要往用户空间传送了
+							memset((vooid*)&ksa,0,sizeof(ksa));
+							ksa.s_b.sbit=(unsigned short)m;
+							ksa.s_b.pbit=(unsigned short)k;
+							ksa.off=(unsigned short)j;
+							memcpy((void*)mc,(void*)&ksa,sizeof(ksa));
+							mc+=4;//2013-12-31改为4字节长度。
+							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
-								mp[0]=1;//调用休眠，循环查询mp[0]==0等待。
-								k_am.sync=1;
-								while(1)
-								{
-									if(mp[0]==0)
-										break;
-									sleep_on_timeout(&whead,200);
-								}
+								s_sync(1);//阻塞在此
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -515,22 +525,15 @@ int first_srh(void *argc)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]) && (c[j+3]==kv1.dest[3]))
 						{
-							mc[0]=(char)m;//段的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&k,2);//页的索引号
-							mc+=2;
-							memcpy((void*)&mc,(void*)&j,sizeof(void*));//页内偏移。
-							mc+=4;
-							if(mc-mp[d_begin]<8)//写满一页，需要往用户空间传送了
+							memset((vooid*)&ksa,0,sizeof(ksa));
+							ksa.s_b.sbit=(unsigned short)m;
+							ksa.s_b.pbit=(unsigned short)k;
+							ksa.off=(unsigned short)j;
+							memcpy((void*)mc,(void*)&ksa,sizeof(ksa));
+							mc+=4;//2013-12-31改为4字节长度。
+							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
-								mp[0]=1;//调用休眠，循环查询mp[0]==0等待。
-								k_am.sync=1;
-								while(1)
-								{
-									if(mp[0]==0)
-										break;
-									sleep_on_timeout(&whead,200);
-								}
+								s_sync(1);//阻塞在此
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -539,24 +542,423 @@ int first_srh(void *argc)
 					}
 				}
 				kunmap(pages[k]);
-				pach_cache_release(pages[k]);
+				page_cache_release(pages[k]);
 			}
-		}
+		}//要释放申请的内存
+		vfree((void*)v);
+		v=NULL;pages=NULL;
 	}//至此全部结束，需要将结束标志置位、取消线程锁。
-	k_am.sync=1;//用户可读
-	k_am.end0=1;//通知用户全部结束的标志
-	memcpy((void*)&mp,(void*)&k_am,sizeof(k_am));//重新将命令区域拷贝至缓冲区
+	s_sync(2);
 	kv1.thread_lock=0;//取消线程锁.退出线程
 	return 0;
+ferr_01:
+	s_sync(2);
+	kv1.thread_lock=0;
+	if(v!=NULL)
+		vfree((void*)v);
+	return 1;
+}//}}}
+//{{{ int next_srh(void *argc)
+int next_srh(void *argc)
+{
+	struct KVAR_SAD kr;
+	char *c,*mc,*md,*v;
+	int ret,len,i,k;
+	struct pid *kpid;
+	struct task_struct *t_str;
+	struct mm_struct *mm_str;
+//	struct vm_area_struct *vadr;
+	struct page **pages;
+	unsigned long adr;
+	wait_queue_head_t	whead;
+	wait_queue_t	wdata;
+	v=NULL;
+	memset((void*)&mp[d_begin],0,d_len);
+	init_waitqueue_head(&whead);
+	init_waitqueue_entry(&wdata,current);
+	add_wait_queue(&whead,&wdata);
+	kpid=find_get_pid(kv1.pid);
+	if(kpid==NULL)
+	{
+		printk("<1>find_get_pid error\n");
+		goto nerr_01;
+	}
+	t_str=pid_task(kpid,PIDTYPE_PID);
+	if(t_str==NULL)
+	{
+		printk("<1>pid_task error\n");
+		goto nerr_01;
+	}
+	mm_str=get_task_mm(t_str);
+	if(mm_str==NULL)
+	{
+		printk("<1>get_task_mm error\n");
+		goto nerr_01;
+	}
+	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
+	kv1.seg[0]=mm_str->start_code;
+	kv1.seg[1]=mm_str->start_data;
+//两个极为关键的设置：c->指向结果缓冲区 mc->指向地址集	
+	c=&tp[d_begin];mc=&mp[d_begin];
+//	len=vma_pages(mm_str->mmap->vm_next);
+	len=vma_pages(mm_str->mmap);
+	if(v==NULL)
+	{
+		v=(char*)vmalloc(sizeof(void*)*(len+1));
+		pages=(struct page **)v;
+		if(pages==NULL)
+		{
+			printk("<1>vmalloc error12\n");
+			goto nerr_01;
+		}
+	}
+	adr=mm_str->mmap->vm_start;
+	memset((void*)pages,0,sizeof(void*)*(len+1));
+	down_write(&mm_str->mmap_sem);
+	ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
+	i=-1;
+	if(ret>0)
+	{
+		while(1)
+		{
+			memset((void*)&kr,0,sizeof(kr));
+			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
+			if(kr.seg!=0)
+				break;
+			if(ret<=kr.pg) //保证页索引没有越界
+			{
+				printk("<1>page index error101\n");
+				if(v!=NULL)
+					vfree(v);//记得释放临时申请的内存.
+				v=NULL;
+				goto nerr_01;
+			}
+			if(i==-1)
+			{
+				i=kr.pg;
+				md=(char*)kmap(pages[kr.pg]);
+			}
+			if(i!=kr.pg)
+			{
+				kunmap(pages[i]);
+				page_cache_release(pages[i]);
+				md=(char)kmap(pages[kr.pg]);
+				i=kr.pg;
+			}
+			k=0;
+			if(k_am.snum<256)
+			{
+				if(k_am.sch[0]==md[kr.offset])
+					k=1;
+			}
+			else
+			{
+				if(k_am.snum<0x10000)
+				{
+					if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]))
+						k=1;
+				}
+				else
+				{
+					if(k_am.snum<0x1000000)
+					{
+						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]))
+							k=1;
+					}
+					else
+					{
+						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]) && (k_am.sch[3]==md[kr.offset+3]))
+							k=1;
+					}
+				}
+			}
+			if(k==1)//find it
+			{
+				memcpy(c,(void*)&kr,sizeof(kr));
+				c+=8;
+				if(c-&tp[d_begin]>7992) //写满一页了
+				{
+					k_am.sync=1;
+					memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
+					kv1.pin=3;
+//					memset((void*)mp,0,sizeof(mp));
+//					memcpy((void*)mp,(void*)tp,K_BUFFER_SIZE);
+					while(1)
+					{
+						if(tp[0]==0)
+							break;
+						sleep_on_timeout(&whead,200);
+					}
+					k_am.sync=0;k_am.end0=0;kv1.pin=0;
+					memset((void*)tp,0,K_BUFFER_SIZE);
+					c=&tp[d_begin];
+				}
+			}
+			mc+=8;//传入的1000个地址查询完成，需要再次读入
+			if(mc-&mp[d_begin]>7992)
+			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
+				kv1.pin=1;mp[0]=1;k_am.sync=1;mp[8]=3;
+				while(1)
+				{
+					if(mp[0]==0)//传入了新的地址队列
+						break;
+					sleep_on_timeout(&whead,200);
+				}
+				kv1.pin=0;k_am.sync=0;mp[8]=0;
+				mc=&mp[d_begin];				
+			}
+		}
+	}
+	up_write(&mm_str->mmap_sem);
+	if(v!=NULL)
+	{	
+		vfree(v);
+		v=NULL;
+	}	
+	if(mm_str->mmap->vm_next==NULL)
+		goto nerr_01;
+	len=vma_pages(mm_str->mmap->vm_next);
+	v=(char*)vmalloc(sizeof(void*)*(len+1));
+	pages=(struct page **)v;
+	if(pages==NULL)
+	{
+		printk("<1>vmalloc error123\n");
+		goto nerr_01;
+	}
+	adr=mm_str->mmap->vm_next->vm_start;
+	memset((void*)pages,0,sizeof(void*)*(len+1));
+	down_write(&mm_str->mmap_sem);
+	ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
+	i=-1;
+	if(ret>0)
+	{
+		while(1)
+		{
+			memset((void*)&kr,0,sizeof(kr));
+			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
+			if(kr.seg!=1)
+				break;
+			if(ret<=kr.pg) //保证页索引没有越界
+			{
+				printk("<1>page index error103\n");
+				if(v!=NULL)
+					vfree(v);//记得释放临时申请的内存.
+				v=NULL;
+				goto nerr_01;
+			}
+			if(i==-1)
+			{
+				i=kr.pg;
+				md=(char*)kmap(pages[ke.pg]);
+			}
+			if(i!=kr.pg)
+			{
+				kunmap(pages[i]);
+				page_cache_release(pages[i]);
+				md=(char)kmap(pages[kr.pg]);
+				i=kr.pg;
+			}
+			k=0;
+			if(k_am.snum<256)
+			{
+				if(k_am.sch[0]==md[kr.offset])
+					k=1;
+			}
+			else
+			{
+				if(k_am.snum<0x10000)
+				{
+					if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]))
+						k=1;
+				}
+				else
+				{
+					if(k_am.snum<0x1000000)
+					{
+						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]))
+							k=1;
+					}
+					else
+					{
+						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]) && (k_am.sch[3]==md[kr.offset+3]))
+							k=1;
+					}
+				}
+			}
+			if(k==1)//find it
+			{
+				memcpy(c,(void*)&kr,sizeof(kr));
+				c+=8;
+				if(c-&tp[d_begin]>7992) //写满一页了
+				{
+					k_am.sync=1;k_am.vv0[0]=0;
+					memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
+					kv1.pin=3;
+//					memset((void*)mp,0,sizeof(mp));
+//					memcpy((void*)mp,(void*)tp,K_BUFFER_SIZE);
+					while(1)
+					{
+						if(tp[0]==0)
+							break;
+						sleep_on_timeout(&whead,200);
+					}
+					k_am.sync=0;k_am.end0=0;kv1.pin=0;
+					memset((void*)tp,0,K_BUFFER_SIZE);
+					c=&tp[d_begin];
+				}
+			}
+			mc+=8;//传入的1000个地址查询完成，需要再次读入
+			if(mc-&mp[d_begin]>7992)
+			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
+				kv1.pin=1;mp[0]=1;k_am.sync=1;mp[8]=3;
+				while(1)
+				{
+					if(mp[0]==0)//传入了新的地址队列
+						break;
+					sleep_on_timeout(&whead,200);
+				}
+				kv1.pin=0;k_am.sync=0;mp[8]=0;
+				mc=&mp[d_begin];				
+			}
+		}
+	}
+	up_write(&mm_str->mmap_sem);
+	if(v!=NULL)
+	{	
+		vfree(v);
+		v=NULL;
+	}	
+	memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
+	tp[7]=1;tp[0]=1;kv1.pin=1;
+	kv1.thread_lock=0;
+	k_am.sync=1;k_am.end0=1;
+	return 0;
+nerr_01:
+	k_am.sync=1;
+	k_am.end0=1;
+	memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
+	kv1.thread_lock=0;
+	kv1.pin=1;
+	if(v!=NULL)
+		vfree((void*)v);
+	return 1;
+}//}}}
+//{{{ void s_sync(int t)
+/*该函数可根据不同的标志字段的设置，确定标志的设置，并进入等待,等待完成后再恢复相关标志。
+  0、等待命令状态：
+  	 （1）此时内核没有工作，仅是等待用户的指令。设置接受缓冲区为mp即可：kv1.pin=1;该状态不能设置，在系统初始化时或其他状态完成后自动进入该状态。
+  1、首次查询：
+  	 只有向外传送一种状态，传送时又有三种情况：
+	 （1）内核没有完成工作，正常的用户查询同步，此时只需将缓冲区设置标志kv1.pin设为：0即可，此时read函数会根据该标志返回用户的查询字长为0,
+	 表示等待中。t=0时设定此状态。次状态没有等待。
+	 （2）内核完成一次（2000地址）的搜索，需要将地址结果传送给用户。此时搜索地址保存在mp缓冲区中，先将mp[0]=1表示用户获取的数据有效，mp[7]=0
+	 表示后续还有结果。最后将改变缓冲区标志kv1.pin设为：1,然后进入查询等待过程，查询mp[0]==0？等于0表示用户已将传出的地址保存，可以继续。此时
+	 修改kv1.pin=0完成退出。t=1时设置此状态。
+	 （3）内核完成全部搜索，先将mp[0]=1,mp[7]=1，表示这是最后的查询。用户在收到最后一批地址后就可再次发送其他命令。再将kv1.pin=1。t=2设置此状态。
+	 此状态也无需等待，直接退出。
+  2、再次查询：
+  	 该操作不仅有向外传送的状态，还有等待用户传入地址集的状态。
+	 （一）向外传送的状态：
+	 （1）内核查询中，正常的用户查询同步，此时将kv1.pin设为：0。该步与首次查询的步骤1完全相同。
+	 （2）内核完成一次查询，需要将地址结果传送给用户，此时保存结果的缓冲区为tp，所以将tp[0]=1，表示数据有效，tp[7]=0,表示不是最终的搜索，tp[8]=0,
+	 表示本次操作是传送结果。然后将缓冲区标志kv1.pin设为：2,表示此时的输出缓冲区为tp。然后进入等待状态。在等待过程中轮寻tp[0]==0?等于0表示用户操作
+	 已经完成，可以退出等待，继续搜索了，此时将kv1.pin=0。t=10设置次状态。
+	 （3）内核完成全部查询，此时输出缓冲区仍然为tp，设置tp[0]=1,tp[7]=1,tp[8]=0,kv1.pin=2。注意此时所有工作虽已完成，但不能直接退出，因为此时的默认
+	 接受缓冲区为tp而不是默认的等待命令状态的mp缓冲区。所以，此时仍需进入等待，轮寻tp[0]==0?当tp[0]==0时，设置kv1.pin=1。完成退出。t=11设置此状态
+	 （二）接受用户输入地址的状态：
+	 （1）接受用户输入，此时使用的输入输出缓冲区为mp，所以mp[0]=1，表示用户接受有效的返回数据（命令），mp[7]=0，注意此时的mp[7]只是准备接受用户设置
+	 的一个标志，用于标识是否全部地址已都输入？返回0时表示还有地址没有输入，返回1时说明这是最后的地址集。mp[8]=1，表示本次的输出为命令，要求用户输
+	 入地址集。最后设置缓冲区切换标志kv1.pin=1，表示mp为输入输出缓冲区。然后进入等待，轮寻mp[0]==0?为真表示已经接受了用户输入的有效地址集。mp[8]=0,
+	 kv1.pin=0。完成退出。t=12设置次状态。
+注意：
+
+	（1）再次搜索的全部完成标志tp[7]=1的设置依据就是用户设置的地址集的全部输入完成标志：mp[7]=1!!
+  	（2）本函数所有涉及到的mp,tp标志的设置，都是依据k_am的状态设置。也就是内核对这些标志的最好不要直接修改，而是修改k_am相关标志，而本函数完成k_am
+	到缓冲区标志的设置。 
+ */
+void s_sync(int t)
+{
+	switch(t)
+	{
+	case 0://内核忙，返回用户的读取字节数为0
+		kv1.pin=0;
+		return;//没有等待。
+	case 1://首次查询，完成一页的地址。
+		mp[0]=1;k_am.sync=1;
+		mp[7]=0;k_am.end0=0;//首次查询的结束标志必须由内核决定。
+		kv1.pin=1;		//确定的输入输出缓冲区为mp;
+		//call wait
+		s_wait_mm(0);
+		kv1.pin=0;k_am.sync=mp[0];
+		return;
+	case 2://首次查询全部完成
+		mp[0]=1;k_am.sync=1;
+		mp[7]=1;k_am.end0=1;
+		kv1.pin=1;
+		return;
+	case 10://再次查询，内核完成一次查询,传送结果给用户 再次查询的结果传送中间查询和最终查询合并，统一使用序号10
+		tp[0]=1;k_am.sync=1;
+		//tp[7]  此时该标志只能根据mp[7]确定。
+		tp[7]=mp[7];k_am.end0=mp[7];
+		tp[8]=0;k_am.vv0[1]=0;//传送的结果。
+		kv1.pin=2;	//缓冲区切换为tp
+		//call wait
+		s_wait_mm(1);
+		if(tp[7]==0)//不是最终搜索
+			kv1.pin=0;
+		else
+			kv1.pin=1;
+		return;
+	case 12://接受用户输入的地址
+		if(mp[7]!=0)
+			return;
+		mp[0]=1;k_am.sync=1;
+		mp[7]=0;k_am.end0=0;
+		mp[8]=1;k_am.vv0[0]=1;
+		kv1.pin=1;
+		//call wait
+		s_wait_mm(0);
+		mp[8]=0;k_am.vv0[0]=0;
+		kv1.pin=0;
+		return;
+	default:
+		printk("<1>error combo\n");
+		break;
+	};
+
+}//}}}
+//{{{ void s_wait_mm()
+void s_wait_mm(int w)
+{
+	wait_queue_head_t	whead;
+//	wait_queue_t	wdata;
+	char *ch;
+	init_waitqueue_head(&whead);
+//	init_waitqueue_entry(&wdata,current);
+//	add_wait_queue(&whead,&wdata);
+	if(w==0)//mp
+		ch=mp;
+	else
+		ch=tp;
+	while(1)
+	{
+		if(ch[0]==0)
+			break;
+		sleep_on_timeout(&whead,200);
+	}
+}//}}}
+
+//{{{ void class_create_release(struct class *cls)
+void class_create_release(struct class *cls)
+{
+	pr_debug("%s called for %s\n",__func__,cls->name);
+	kfree(cls);
 }//}}}
 
 
 
-
-
-
-
-
+module_init(reg_init);
+module_exit(reg_exit);
 
 
 
