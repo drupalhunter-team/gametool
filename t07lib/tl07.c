@@ -7,6 +7,9 @@ void crt_window(int a,char **b)
 	GtkTreeIter iter;
 	int i,j,k;
 	char ch[36];
+	if(!g_thread_supported())
+		g_thread_init(NULL);
+	gdk_threads_init();
 	gtk_init(&a,&b);
 	ws.window=gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(ws.window),wintitle);
@@ -29,6 +32,7 @@ void crt_window(int a,char **b)
 	gtk_widget_show_all(ws.window);
 	g_signal_connect(G_OBJECT(ws.window),"delete-event",G_CALLBACK(hide_window),NULL);
 //	g_signal_connect_swapped(G_OBJECT(ws.window),"destroy",G_CALLBACK(gtk_main_quit),NULL);
+	ws.thread_lock=0;ws.pid=0;ws.sn=0;
 	gtk_main();
 }//}}}
 //{{{ GdkPixbuf *crt_pixbuf(gchar *fname)
@@ -129,6 +133,8 @@ void crt_part2()
 	ws.bnt[4]=gtk_button_new_with_label("保存至文件");
 	gtk_widget_set_size_request(ws.bnt[4],bnt5_w,bnt5_h);
 	gtk_fixed_put(GTK_FIXED(ws.fixed),ws.bnt[4],bnt5_px,bnt5_py);
+//添加按钮的消息响应函数
+	g_signal_connect(G_OBJECT(ws.bnt[2]),"clicked",G_CALLBACK(on_first_srh),NULL);
 }//}}}
 //{{{ void crt_part3()
 void crt_part3()
@@ -272,12 +278,15 @@ void on_tree1_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *
 {
 	GtkTreeModel *model;
 	GtkTreeIter iter;
-	GValue value;
+	GValue value,va;
 	char ch[200];
 	memset((void*)&value,0,sizeof(value));
 	model=gtk_tree_view_get_model(treeview);
 	if(gtk_tree_model_get_iter(model,&iter,path))
 	{
+		gtk_tree_model_get_value(model,&iter,0,&value);
+		ws.pid=g_value_get_int(&value);//get pid
+		g_value_unset(&value);
 		gtk_tree_model_get_value(model,&iter,1,&value);
 		memset(ch,0,sizeof(ch));
 		snprintf(ch,sizeof(ch),labi,g_value_get_string(&value));
@@ -357,12 +366,188 @@ gint hide_window(GtkWidget *widget,GdkEvent *event,gpointer gp)
 	gtk_status_icon_set_visible(ws.sicon,TRUE);
 	return TRUE;
 }//}}}
+//{{{ void on_first_srh(GtkWidget *widget,gpointer gp)
+void on_first_srh(GtkWidget *widget,gpointer gp)
+{
+	char *p;
+	if(ws.thread_lock==1)
+	{
+		messagebox("查询中....请稍后操作");
+		return;
+	}
+	if(ws.pid<1)
+	{
+		messagebox("请先选择待查询的目标进程");
+		return;
+	}
+	p=(char*)gtk_entry_get_text(GTK_ENTRY(ws.entry[0]));
+	if(check_input(p))
+	{
+		messagebox("输入的查询数据有误");
+		return;
+	}
+//	thd_fst(0);
+	g_thread_create(thd_fst,NULL,FALSE,NULL);
+//	p=(char*)gtk_label_get_text(GTK_LABEL(ws.label));
 
 
-
-
-
-
+}//}}}
+//{{{ int check_input(char *c)
+int check_input(char *c)
+{
+	int i,j;
+	char ch[20];
+	j=strlen(c);
+	if(j>10)
+		return 1;
+	memset(ch,0,sizeof(ch));
+	ws.sn=0;
+//取得数据的进制类型
+	if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ws.radio[0])))
+	{//十进制
+		for(i=0;i<j;i++)
+		{
+			if(c[i]>0x39 ||c[i]<0x30) //no number
+			{
+				ws.sn=0;
+				return 1;
+			}
+			ws.sn*=10;
+			ws.sn+=c[i];ws.sn-=0x30;
+		}
+	}
+	else
+	{//十六进制
+		for(i=0;i<j;i++)
+		{
+			ch[i]=toupper(c[i]);
+			if(ch[i]>=0x30 && ch[i]<=0x39)
+			{
+				ws.sn*=16;ws.sn+=ch[i];
+				ws.sn-=0x30;
+			}
+			else
+			{
+				if(ch[i]>='A' && ch[i]<='F')
+				{
+					ws.sn*=16;ws.sn+=ch[i];
+					ws.sn-=0x37;
+				}
+				else
+				{
+					ws.sn=0;return 1;
+				}
+			}
+		}
+	}
+	return 0;
+}//}}}
+//{{{ gpointer thd_fst(gpointer pt)
+gpointer thd_fst(gpointer pt)
+{
+	int i,j,k,l,fd;
+	char ch[20],*c;
+	struct KVAR_AM *k_am;
+	struct KVAR_SAD *ksa;
+	GtkTreeIter iter;
+	ws.thread_lock=1;//锁定
+	g_print("aaaaaaaa\n");
+	k_am=(struct KVAR_AM *)ws.g_ch;
+	ksa=(struct KVAR_SAD*)&(ws.g_ch[d_begin]);
+	memset(ws.g_ch,0,buf_size);
+	k_am->cmd=1;					//首次查询命令字
+	k_am->pid=ws.pid;			//目标pid 
+	k_am->snum=ws.sn;			//查询关键字
+	fd=open(drv_name,O_RDWR);
+	if(fd<0)
+	{
+		messagebox("目标模块连接失败");
+		goto thd_01;
+	}
+	i=write(fd,ws.g_ch,buf_size);//发送命令
+	if(i!=buf_size)
+	{
+		messagebox("首次查询指令发送失败");
+		goto thd_01;
+	}
+	msleep();
+	//开始进入轮寻等待
+	//g_timeout_add(300,(GSourceFunc),(gpointer)fd); //1second=1000
+	memset(ws.g_ch,0,buf_size);
+	c=ws.g_addr[0];k=0;
+	memset(c,0,adr_buf1);
+	gtk_list_store_clear(ws.store[2]);//先清空列表
+	//while(1)
+	//{
+f_002:	
+		i=read(fd,ws.g_ch,buf_size);
+		if(i==buf_size)//有数据返回
+		{
+			if(k_am->sync!=1)
+			{
+				msleep();
+//				messagebox("不可能的错误。");
+				//break;
+				goto f_002;
+	//			continue;
+			}
+			//开始读取数据并显示。
+			ksa=(struct KVAR_SAD*)&(ws.g_ch[d_begin]);
+			for(l=0;l<2000;l++)//最多2000个地址
+			{
+				if(ksa->spg==0 && ksa->off==0)
+					break;
+				if(ksa->s_b.sbit==0)//code
+					j=(int)k_am->text_seg;
+				else
+					j=(int)k_am->data_seg;
+				i=(int)ksa->s_b.pbit;i*=4096;
+				j+=i;j+=(int)ksa->off;
+				memset(ch,0,sizeof(ch));
+				snprintf(ch,sizeof(ch),"0x%lx",j);
+				gtk_list_store_append(ws.store[2],&iter);
+				gtk_list_store_set(ws.store[2],&iter,0,(int)ksa->s_b.pbit,1,ch,-1);
+				ksa++;
+			}
+			memcpy((void*)c,(void*)&(ws.g_ch[d_begin]),d_len);
+			c+=buf_size;k++;
+			if(k_am->end0==1)//全部结束
+			{
+				messagebox("全部查询完成");
+				//break;
+			}
+			//给内核模块发送完成标志。
+			memset((void*)&(ws.g_ch[d_begin]),0,d_len);
+			k_am->sync=0;k_am->end0=1;
+			i=write(fd,ws.g_ch,buf_size);
+			if(i<0)
+			{
+				//msleep();
+				//i=write(fd,ws.g_ch,buf_size);
+				messagebox("向内核发送指令失败");
+				goto thd_01;
+			}
+			msleep();
+			if(k>=30)//缓冲区g_addr[0]已满
+			{
+				messagebox("获取的地址已超过6万～");
+				goto thd_01;
+			}
+		}
+		msleep();
+	//}
+thd_01:
+	close(fd);
+	ws.thread_lock=0;
+	return 0;	
+}//}}}
+//{{{ void msleep()
+void msleep()
+{
+  tm.tv_sec=0;
+  tm.tv_usec=300000;	//300毫秒
+  select(0,NULL,NULL,NULL,&tm);
+}//}}}
 
 
 

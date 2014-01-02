@@ -18,10 +18,76 @@ struct win_struct
 	GtkWidget *menu_set;
 	GtkWidget *menu_exit;
 	GtkWidget *label;
+//下列定义与模块及线程相关	
+	int		  thread_lock;//线程锁
+	char	  *g_ch;		//通讯缓冲
+	char	  *g_addr[2]; //两个结果地址缓冲
+	int		  pid;		//进程pid
+	int		  sn;		//查找数字
 };
 struct win_struct ws;
+//定义一个与模块相关的结构。
+struct SEG_DESC
+{
+    unsigned short pbit:15;         //页占15位
+    unsigned short sbit:1;          //段占1位，=0表示代码段，=1数据段。
+};
+struct KVAR_SAD
+{
+    union{
+        struct SEG_DESC s_b;
+        unsigned short  spg;
+    };  
+    union{
+        unsigned short off;
+        unsigned char  ofch[2];
+    };  
+};//现在的结构一次可传送2000地址。
+struct KVAR_ADDR
+{
+    unsigned int maxd;          //上限
+    unsigned int mind;          //下限
+    struct KVAR_SAD ksa;        //地址结构
+    unsigned char vv0[4];       //无用，使结构为16字节
+};
 
+struct KVAR_AM
+{
+    unsigned char sync;                 //命令字段中0字节的同步标志，
+    unsigned char cmd;                  //命令字段中1字节的主命令标志
+    union{
+    int   pid;                          //命令字段中的2-5字节，传入的pid
+    unsigned char  pch[4];
+    };
+    unsigned char proc;                 //命令字段中的6字节，存放进度值1-100
+    unsigned char end0;                 //命令字段中的7字节，存放本次查询的结束标志，=1结束
+    char vv0[2];                        //命令字段中的8,9字节，暂时未用。再次查询时在副本中用到8字节=3表示有效。
+    union{
+    unsigned long snum;                 //命令字段中的10字节起的查询关键字。
+    unsigned char sch[4];
+    };
+    char oaddr[4];                      //命令字段中的14字节起的导出地址。
+    char vv1[22];                       //18-47字节暂时未,可以考虑传送代码段和数据段的段地址。
+    union{
+    unsigned int data_seg;
+    unsigned char dsg[4];
+    };
+    union{
+    unsigned int text_seg;
+    unsigned char tsg[4];
+    };
+    struct KVAR_ADDR vadd[8];           //8个锁定（修改）数据和地址。 
+};
+
+struct KVAR_SAD	 ksa;
+struct timeval tm;
 //{{{ define
+#define buf_size			8192
+#define adr_buf1			1024*240
+#define adr_buf2			4096
+#define d_begin				192
+#define d_len				8000
+#define drv_name			"/dev/memacc_8964_dev"
 
 #define	wintitle			"修改大师V1.0"
 //window's width & height
@@ -198,6 +264,8 @@ void crt_part3();
 void on_getproc(GtkWidget *widget,gpointer gp);
 //按钮2 "重置"的响应函数
 void on_reset(GtkWidget *widget,gpointer pg);
+//按钮3 "首次查找"的响应函数
+void on_first_srh(GtkWidget *widget,gpointer gp);
 //消息提示框
 void messagebox(char *gc);
 //树形列表1的双击响应函数
@@ -214,6 +282,20 @@ void exit_window(GtkWidget *widget,gpointer gp);
 void show_menu(GtkWidget *widget,guint button,guint32 act_time,gpointer gp);
 //主窗口隐藏，切换至托盘形式
 gint hide_window(GtkWidget *widget,GdkEvent *event,gpointer gp);
+//首次查找的按钮响应函数
+void on_first_srh(GtkWidget *widget,gpointer gp);
+//检查输入的查询关键字函数
+int check_input(char *c);
+//首次查找的线程函数
+gpointer thd_fst(gpointer pt);
+//一个毫秒级的定时器
+void msleep();
+
+
+
+
+
+
 
 
 

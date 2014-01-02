@@ -46,41 +46,10 @@ struct KVAR_ADDR
 {
 	unsigned int maxd;			//上限
 	unsigned int mind;			//下限
-	struct KVAR_SAD;			//地址结构
+	struct KVAR_SAD ksa;		//地址结构
 	unsigned char vv0[4];		//无用，使结构为16字节
 };
 
-/*
-struct KVAR_SAD
-{
-	unsigned char seg;
-	unsigned char vv0;
-	union{
-	unsigned char page[2];			//由此也限制了页数最大为0xffff
-	unsigned short pg;
-	};
-	union{
-	unsigned int  offset;			//偏移
-	char offch[4];
-	};
-};
-struct KVAR_ADDR
-{
-	unsigned int	maxd;			//上限
-	unsigned int	mind;			//下限
-	union{
-	unsigned char  seg[2];			//段索引
-	unsigned short sh;
-	};
-	union{
-	unsigned short pg;				//页索引
-	unsigned char  gch[2];			//
-	};
-	union{
-	unsigned int   pin;				//页内偏移
-	unsigned char  inch[4];
-	};
-};*/
 struct KVAR_AM
 {
 	unsigned char sync;					//命令字段中0字节的同步标志，
@@ -127,7 +96,7 @@ MODULE_AUTHOR("tybitsfox ([email]tybitsfox@126.com[/email])");
 MODULE_DESCRIPTION("kernel memory access module.");
 //
 #define K_BUFFER_SIZE		8192
-#define DRV_MAJOR			252
+#define DRV_MAJOR			246
 #define DRV_MINOR			0
 #define drv_name			"memacc_8964_dev"
 #define d_begin				192
@@ -172,8 +141,8 @@ struct KVAR_TY kv1;
 struct KVAR_AM k_am;
 //和命令头对应的结构
 
-static int __init reg_init(void);
-static void __exit reg_exit(void);
+static int __init areg_init(void);
+static void __exit areg_exit(void);
 static int mem_open(struct inode *ind,struct file *filp);
 static int mem_release(struct inode *ind,struct file *filp);
 static ssize_t mem_read(struct file *filp,char __user *buf,size_t size,loff_t *fpos);
@@ -195,8 +164,8 @@ struct file_operations mem_fops=
 	.read=mem_read,
 	.write=mem_write,
 };
-//{{{ int __init reg_init(void)
-int __init reg_init(void)
+//{{{ int __init areg_init(void)
+int __init areg_init(void)
 {
 	int res,retval;
 	int devno;
@@ -247,8 +216,8 @@ reg_err01:
 	suc=1;
 	return -1;
 }//}}}
-//{{{ void __exit reg_exit(void)
-void __exit reg_exit(void)
+//{{{ void __exit areg_exit(void)
+void __exit areg_exit(void)
 {
 	if(suc!=0)
 		return;
@@ -342,7 +311,7 @@ ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 	res=copy_from_user(tmp,buf,size);
 	if(res==0)
 	{
-		if(tmp[0]!=0)
+		if(tmp[0]!=0 || tmp[7]==1)
 			return size;
 //		printk("<1>copy data from u->k success!\n");
 		if(kv1.thread_lock==0)//命令分析，仅在没有线程运行时才有效。
@@ -374,22 +343,24 @@ ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 		//数据都是有效的，并且如果线程如果启动了，在这应该保存传入的地址。--这实际上是使用一个线程
 		//完成全部本次查找还是每查找1000个地址启动一个新线程的选择。每次启动新线程无疑处理起来简单.
 		//但是考虑到效率的话，这种单线程方式应该更加有效。	
+			s_wait_mm(2);
 			return size;
 		}
 	}
+	s_wait_mm(2);
 	return 0;
 }//}}}
 //{{{ int first_srh(void)
 int first_srh(void *argc)
 {
 	char *c,*mc,*v;
-	int ret,len,i,j,k,m,n;
+	int ret,len,j,k,m,n;
 	struct pid *kpid;
 	struct task_struct *t_str;
 	struct mm_struct *mm_str;
 	struct vm_area_struct *vadr;
 	struct page **pages;
-	unsigned long adr,sadr;
+	unsigned long adr;
 	struct KVAR_SAD ksa;
 	v=NULL;
 	memset((void*)&mp[d_begin],0,d_len);
@@ -414,7 +385,8 @@ int first_srh(void *argc)
 	}
 	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
 	kv1.seg[0]=mm_str->start_code;
-	kv1.seg[1]=mm_str->end_code;
+	kv1.seg[1]=mm_str->start_data;//end_code;
+	printk("<1>code seg: 0x%lx data seg: 0x%lx\n",kv1.seg[0],kv1.seg[1]);
 	n=0;
 	for(m=0;m<2;m++)
 	{//段的循环，只查询代码段和数据段。
@@ -455,11 +427,12 @@ int first_srh(void *argc)
 				c=(char*)kmap(pages[k]);
 				if(kv1.dnum<256)//按字节查询
 				{
+					printk("<1>less than 256\n");
 					for(j=0;j<4096;j++)
 					{
 						if(c[j]==kv1.dest[0])
 						{
-							memset((vooid*)&ksa,0,sizeof(ksa));
+							memset((void*)&ksa,0,sizeof(ksa));
 							ksa.s_b.sbit=(unsigned short)m;
 							ksa.s_b.pbit=(unsigned short)k;
 							ksa.off=(unsigned short)j;
@@ -467,7 +440,12 @@ int first_srh(void *argc)
 							mc+=4;//2013-12-31改为4字节长度。
 							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
+								kunmap(pages[k]);
+								page_cache_release(pages[k]);
+								up_write(&mm_str->mmap_sem);
+								printk("<1>one page end\n");
 								s_sync(1);//阻塞在此
+								goto ferr_01;
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -477,11 +455,12 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x10000 && kv1.dnum>0xff)
 				{
+					printk("<1>less than 0x10000\n");
 					for(j=0;j<4095;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]))
 						{
-							memset((vooid*)&ksa,0,sizeof(ksa));
+							memset((void*)&ksa,0,sizeof(ksa));
 							ksa.s_b.sbit=(unsigned short)m;
 							ksa.s_b.pbit=(unsigned short)k;
 							ksa.off=(unsigned short)j;
@@ -499,11 +478,12 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x1000000 && kv1.dnum>0xffff)
 				{
+					printk("<1>less than 0x1000000\n");
 					for(j=0;j<4094;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]))
 						{
-							memset((vooid*)&ksa,0,sizeof(ksa));
+							memset((void*)&ksa,0,sizeof(ksa));
 							ksa.s_b.sbit=(unsigned short)m;
 							ksa.s_b.pbit=(unsigned short)k;
 							ksa.off=(unsigned short)j;
@@ -521,11 +501,12 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x100000000 && kv1.dnum>0xffffff)
 				{
+					printk("<1>less than 0x100000000\n");
 					for(j=0;j<4093;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]) && (c[j+3]==kv1.dest[3]))
 						{
-							memset((vooid*)&ksa,0,sizeof(ksa));
+							memset((void*)&ksa,0,sizeof(ksa));
 							ksa.s_b.sbit=(unsigned short)m;
 							ksa.s_b.pbit=(unsigned short)k;
 							ksa.off=(unsigned short)j;
@@ -547,15 +528,18 @@ int first_srh(void *argc)
 		}//要释放申请的内存
 		vfree((void*)v);
 		v=NULL;pages=NULL;
+		up_write(&mm_str->mmap_sem);
 	}//至此全部结束，需要将结束标志置位、取消线程锁。
 	s_sync(2);
 	kv1.thread_lock=0;//取消线程锁.退出线程
 	return 0;
 ferr_01:
+	printk("<1>ready to exit kernel_thread\n");
 	s_sync(2);
 	kv1.thread_lock=0;
 	if(v!=NULL)
 		vfree((void*)v);
+	printk("<1>kernel_thread finished!\n");
 	return 1;
 }//}}}
 //{{{ int next_srh(void *argc)
@@ -570,13 +554,8 @@ int next_srh(void *argc)
 //	struct vm_area_struct *vadr;
 	struct page **pages;
 	unsigned long adr;
-	wait_queue_head_t	whead;
-	wait_queue_t	wdata;
 	v=NULL;
-	memset((void*)&mp[d_begin],0,d_len);
-	init_waitqueue_head(&whead);
-	init_waitqueue_entry(&wdata,current);
-	add_wait_queue(&whead,&wdata);
+//	memset((void*)&mp[d_begin],0,d_len);
 	kpid=find_get_pid(kv1.pid);
 	if(kpid==NULL)
 	{
@@ -600,6 +579,7 @@ int next_srh(void *argc)
 	kv1.seg[1]=mm_str->start_data;
 //两个极为关键的设置：c->指向结果缓冲区 mc->指向地址集	
 	c=&tp[d_begin];mc=&mp[d_begin];
+	memset((void*)c,0,d_len);
 //	len=vma_pages(mm_str->mmap->vm_next);
 	len=vma_pages(mm_str->mmap);
 	if(v==NULL)
@@ -616,16 +596,16 @@ int next_srh(void *argc)
 	memset((void*)pages,0,sizeof(void*)*(len+1));
 	down_write(&mm_str->mmap_sem);
 	ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
-	i=-1;
+	i=-1;md=mc;
 	if(ret>0)
 	{
 		while(1)
 		{
 			memset((void*)&kr,0,sizeof(kr));
 			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
-			if(kr.seg!=0)
+			if(kr.s_b.sbit!=0)
 				break;
-			if(ret<=kr.pg) //保证页索引没有越界
+			if(ret<=kr.s_b.pbit || kr.spg==0) //保证页索引没有越界,或者为空
 			{
 				printk("<1>page index error101\n");
 				if(v!=NULL)
@@ -635,76 +615,54 @@ int next_srh(void *argc)
 			}
 			if(i==-1)
 			{
-				i=kr.pg;
-				md=(char*)kmap(pages[kr.pg]);
+				i=kr.s_b.pbit;
+				md=(char*)kmap(pages[kr.s_b.pbit]);
 			}
-			if(i!=kr.pg)
+			if(i!=kr.s_b.pbit)
 			{
 				kunmap(pages[i]);
 				page_cache_release(pages[i]);
-				md=(char)kmap(pages[kr.pg]);
-				i=kr.pg;
+				md=(char*)kmap(pages[kr.s_b.pbit]);
+				i=kr.s_b.pbit;
 			}
 			k=0;
 			if(k_am.snum<256)
 			{
-				if(k_am.sch[0]==md[kr.offset])
+				if(k_am.sch[0]==md[kr.off])
 					k=1;
+				goto n_01; 
 			}
-			else
+			if(k_am.snum<0x10000)
 			{
-				if(k_am.snum<0x10000)
-				{
-					if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]))
-						k=1;
-				}
-				else
-				{
-					if(k_am.snum<0x1000000)
-					{
-						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]))
-							k=1;
-					}
-					else
-					{
-						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]) && (k_am.sch[3]==md[kr.offset+3]))
-							k=1;
-					}
-				}
+				if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]))
+					k=1;
+				goto n_01;
 			}
+			if(k_am.snum<0x1000000)
+			{
+				if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]) &&(k_am.sch[2]==md[kr.off+2]))
+					k=1;
+				goto n_01;
+			}
+			if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]) &&(k_am.sch[2]==md[kr.off+2]) && (k_am.sch[3]==md[kr.off+3]))
+				k=1;
+n_01:			
 			if(k==1)//find it
 			{
 				memcpy(c,(void*)&kr,sizeof(kr));
-				c+=8;
-				if(c-&tp[d_begin]>7992) //写满一页了
+				c+=4;
+				if(c-&tp[d_begin]>7996) //写满一页了
 				{
-					k_am.sync=1;
-					memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
-					kv1.pin=3;
-//					memset((void*)mp,0,sizeof(mp));
-//					memcpy((void*)mp,(void*)tp,K_BUFFER_SIZE);
-					while(1)
-					{
-						if(tp[0]==0)
-							break;
-						sleep_on_timeout(&whead,200);
-					}
-					k_am.sync=0;k_am.end0=0;kv1.pin=0;
-					memset((void*)tp,0,K_BUFFER_SIZE);
+					s_sync(10);
+					//清空缓冲区
+					memset((void*)&tp[d_begin],0,d_len);
 					c=&tp[d_begin];
 				}
 			}
-			mc+=8;//传入的1000个地址查询完成，需要再次读入
-			if(mc-&mp[d_begin]>7992)
+			mc+=4;//传入的1000个地址查询完成，需要再次读入
+			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
-				kv1.pin=1;mp[0]=1;k_am.sync=1;mp[8]=3;
-				while(1)
-				{
-					if(mp[0]==0)//传入了新的地址队列
-						break;
-					sleep_on_timeout(&whead,200);
-				}
-				kv1.pin=0;k_am.sync=0;mp[8]=0;
+				s_sync(12);
 				mc=&mp[d_begin];				
 			}
 		}
@@ -713,7 +671,7 @@ int next_srh(void *argc)
 	if(v!=NULL)
 	{	
 		vfree(v);
-		v=NULL;
+		v=NULL;pages=NULL;
 	}	
 	if(mm_str->mmap->vm_next==NULL)
 		goto nerr_01;
@@ -736,9 +694,9 @@ int next_srh(void *argc)
 		{
 			memset((void*)&kr,0,sizeof(kr));
 			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
-			if(kr.seg!=1)
+			if(kr.s_b.sbit!=1)
 				break;
-			if(ret<=kr.pg) //保证页索引没有越界
+			if(ret<=kr.s_b.pbit) //保证页索引没有越界
 			{
 				printk("<1>page index error103\n");
 				if(v!=NULL)
@@ -748,76 +706,53 @@ int next_srh(void *argc)
 			}
 			if(i==-1)
 			{
-				i=kr.pg;
-				md=(char*)kmap(pages[ke.pg]);
+				i=kr.s_b.pbit;
+				md=(char*)kmap(pages[kr.s_b.pbit]);
 			}
-			if(i!=kr.pg)
+			if(i!=kr.s_b.pbit)
 			{
 				kunmap(pages[i]);
 				page_cache_release(pages[i]);
-				md=(char)kmap(pages[kr.pg]);
-				i=kr.pg;
+				md=(char*)kmap(pages[kr.s_b.pbit]);
+				i=kr.s_b.pbit;
 			}
 			k=0;
 			if(k_am.snum<256)
 			{
-				if(k_am.sch[0]==md[kr.offset])
+				if(k_am.sch[0]==md[kr.off])
 					k=1;
+				goto n_02;
 			}
-			else
+			if(k_am.snum<0x10000)
 			{
-				if(k_am.snum<0x10000)
-				{
-					if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]))
-						k=1;
-				}
-				else
-				{
-					if(k_am.snum<0x1000000)
-					{
-						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]))
-							k=1;
-					}
-					else
-					{
-						if((k_am.sch[0]==md[kr.offset]) &&(k_am.sch[1]==md[kr.offset+1]) &&(k_am.sch[2]==md[kr.offset+2]) && (k_am.sch[3]==md[kr.offset+3]))
-							k=1;
-					}
-				}
+				if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]))
+					k=1;
+				goto n_02;
 			}
+			if(k_am.snum<0x1000000)
+			{
+				if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]) &&(k_am.sch[2]==md[kr.off+2]))
+					k=1;
+				goto n_02;
+			}
+			if((k_am.sch[0]==md[kr.off]) &&(k_am.sch[1]==md[kr.off+1]) &&(k_am.sch[2]==md[kr.off+2]) && (k_am.sch[3]==md[kr.off+3]))
+				k=1;
+n_02:
 			if(k==1)//find it
 			{
 				memcpy(c,(void*)&kr,sizeof(kr));
-				c+=8;
-				if(c-&tp[d_begin]>7992) //写满一页了
+				c+=4;
+				if(c-&tp[d_begin]>7996) //写满一页了
 				{
-					k_am.sync=1;k_am.vv0[0]=0;
-					memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
-					kv1.pin=3;
-//					memset((void*)mp,0,sizeof(mp));
-//					memcpy((void*)mp,(void*)tp,K_BUFFER_SIZE);
-					while(1)
-					{
-						if(tp[0]==0)
-							break;
-						sleep_on_timeout(&whead,200);
-					}
-					k_am.sync=0;k_am.end0=0;kv1.pin=0;
-					memset((void*)tp,0,K_BUFFER_SIZE);
+					s_sync(10);
+					memset((void*)&tp[d_begin],0,d_len);
 					c=&tp[d_begin];
 				}
 			}
-			mc+=8;//传入的1000个地址查询完成，需要再次读入
-			if(mc-&mp[d_begin]>7992)
+			mc+=4;//传入的2000个地址查询完成，需要再次读入
+			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
-				kv1.pin=1;mp[0]=1;k_am.sync=1;mp[8]=3;
-				while(1)
-				{
-					if(mp[0]==0)//传入了新的地址队列
-						break;
-					sleep_on_timeout(&whead,200);
-				}
-				kv1.pin=0;k_am.sync=0;mp[8]=0;
+				s_sync(12);
 				mc=&mp[d_begin];				
 			}
 		}
@@ -827,18 +762,18 @@ int next_srh(void *argc)
 	{	
 		vfree(v);
 		v=NULL;
-	}	
-	memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
-	tp[7]=1;tp[0]=1;kv1.pin=1;
+	}//写入最后剩余的地址集	
+	//确保为最终退出操作：
+	mp[7]=1;
+	s_sync(10);
 	kv1.thread_lock=0;
-	k_am.sync=1;k_am.end0=1;
 	return 0;
 nerr_01:
-	k_am.sync=1;
-	k_am.end0=1;
-	memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
+	//错误的时候把地址缓冲清空再传送
+	memset((void*)tp,0,K_BUFFER_SIZE);
+	mp[7]=1;
+	s_sync(10);
 	kv1.thread_lock=0;
-	kv1.pin=1;
 	if(v!=NULL)
 		vfree((void*)v);
 	return 1;
@@ -886,6 +821,8 @@ void s_sync(int t)
 	case 1://首次查询，完成一页的地址。
 		mp[0]=1;k_am.sync=1;
 		mp[7]=0;k_am.end0=0;//首次查询的结束标志必须由内核决定。
+		k_am.text_seg=kv1.seg[0];
+		k_am.data_seg=kv1.seg[1];
 		kv1.pin=1;		//确定的输入输出缓冲区为mp;
 		//call wait
 		s_wait_mm(0);
@@ -894,13 +831,17 @@ void s_sync(int t)
 	case 2://首次查询全部完成
 		mp[0]=1;k_am.sync=1;
 		mp[7]=1;k_am.end0=1;
+		k_am.text_seg=kv1.seg[0];
+		k_am.data_seg=kv1.seg[1];
 		kv1.pin=1;
 		return;
 	case 10://再次查询，内核完成一次查询,传送结果给用户 再次查询的结果传送中间查询和最终查询合并，统一使用序号10
 		tp[0]=1;k_am.sync=1;
 		//tp[7]  此时该标志只能根据mp[7]确定。
 		tp[7]=mp[7];k_am.end0=mp[7];
-		tp[8]=0;k_am.vv0[1]=0;//传送的结果。
+		tp[8]=0;k_am.vv0[0]=0;//传送的结果。
+		k_am.text_seg=kv1.seg[0];
+		k_am.data_seg=kv1.seg[1];
 		kv1.pin=2;	//缓冲区切换为tp
 		//call wait
 		s_wait_mm(1);
@@ -910,8 +851,18 @@ void s_sync(int t)
 			kv1.pin=1;
 		return;
 	case 12://接受用户输入的地址
+		k_am.text_seg=kv1.seg[0];
+		k_am.data_seg=kv1.seg[1];
 		if(mp[7]!=0)
+		{//此时应该自动转至最终查询
+			tp[0]=1;k_am.sync=1;
+			tp[7]=1;k_am.end0=1;
+			tp[8]=0;k_am.vv0[0]=0;
+			kv1.pin=2;
+			s_wait_mm(1);
+			kv1.pin=1;
 			return;
+		}
 		mp[0]=1;k_am.sync=1;
 		mp[7]=0;k_am.end0=0;
 		mp[8]=1;k_am.vv0[0]=1;
@@ -931,15 +882,24 @@ void s_sync(int t)
 void s_wait_mm(int w)
 {
 	wait_queue_head_t	whead;
-//	wait_queue_t	wdata;
+	wait_queue_t	wdata;
 	char *ch;
 	init_waitqueue_head(&whead);
-//	init_waitqueue_entry(&wdata,current);
-//	add_wait_queue(&whead,&wdata);
+	init_waitqueue_entry(&wdata,current);
+	add_wait_queue(&whead,&wdata);
+	printk("<1>a sleep\n");
 	if(w==0)//mp
 		ch=mp;
 	else
-		ch=tp;
+	{
+		if(w==1)
+			ch=tp;
+		else
+		{
+			sleep_on_timeout(&whead,HZ);
+			return;
+		}
+	}
 	while(1)
 	{
 		if(ch[0]==0)
@@ -957,8 +917,8 @@ void class_create_release(struct class *cls)
 
 
 
-module_init(reg_init);
-module_exit(reg_exit);
+module_init(areg_init);
+module_exit(areg_exit);
 
 
 
