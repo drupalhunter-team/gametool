@@ -427,7 +427,6 @@ int first_srh(void *argc)
 				c=(char*)kmap(pages[k]);
 				if(kv1.dnum<256)//按字节查询
 				{
-					printk("<1>less than 256\n");
 					for(j=0;j<4096;j++)
 					{
 						if(c[j]==kv1.dest[0])
@@ -440,12 +439,12 @@ int first_srh(void *argc)
 							mc+=4;//2013-12-31改为4字节长度。
 							if(mc-&mp[d_begin]>7996)//写满一页，需要往用户空间传送了
 							{
-								kunmap(pages[k]);
-								page_cache_release(pages[k]);
-								up_write(&mm_str->mmap_sem);
-								printk("<1>one page end\n");
+							//	kunmap(pages[k]);
+							//	page_cache_release(pages[k]);
+							//	up_write(&mm_str->mmap_sem);
+							//	printk("<1>one page end\n");
 								s_sync(1);//阻塞在此
-								goto ferr_01;
+							//	goto ferr_01;
 								//重置指针
 								mc=&mp[d_begin];
 								memset((void*)&mp[d_begin],0,d_len);//清空数据缓冲
@@ -455,7 +454,6 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x10000 && kv1.dnum>0xff)
 				{
-					printk("<1>less than 0x10000\n");
 					for(j=0;j<4095;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]))
@@ -478,7 +476,6 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x1000000 && kv1.dnum>0xffff)
 				{
-					printk("<1>less than 0x1000000\n");
 					for(j=0;j<4094;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]))
@@ -501,7 +498,6 @@ int first_srh(void *argc)
 				}
 				if(kv1.dnum<0x100000000 && kv1.dnum>0xffffff)
 				{
-					printk("<1>less than 0x100000000\n");
 					for(j=0;j<4093;j++)
 					{
 						if((c[j]==kv1.dest[0]) && (c[j+1]==kv1.dest[1]) && (c[j+2]==kv1.dest[2]) && (c[j+3]==kv1.dest[3]))
@@ -529,17 +525,18 @@ int first_srh(void *argc)
 		vfree((void*)v);
 		v=NULL;pages=NULL;
 		up_write(&mm_str->mmap_sem);
+		printk("<1>seg finished\n");
 	}//至此全部结束，需要将结束标志置位、取消线程锁。
 	s_sync(2);
 	kv1.thread_lock=0;//取消线程锁.退出线程
 	return 0;
 ferr_01:
-	printk("<1>ready to exit kernel_thread\n");
+//	printk("<1>ready to exit kernel_thread\n");
 	s_sync(2);
 	kv1.thread_lock=0;
 	if(v!=NULL)
 		vfree((void*)v);
-	printk("<1>kernel_thread finished!\n");
+//	printk("<1>kernel_thread finished!\n");
 	return 1;
 }//}}}
 //{{{ int next_srh(void *argc)
@@ -819,29 +816,37 @@ void s_sync(int t)
 		kv1.pin=0;
 		return;//没有等待。
 	case 1://首次查询，完成一页的地址。
-		mp[0]=1;k_am.sync=1;
-		mp[7]=0;k_am.end0=0;//首次查询的结束标志必须由内核决定。
+		k_am.sync=1;//mp[0]=1;mp[7]=0;
+		k_am.end0=0;//首次查询的结束标志必须由内核决定。
+//		memcpy((void*)&mp[40],(void*)&kv1.seg[1],sizeof(int));//save data segment
+//		memcpy((void*)&mp[44],(void*)&kv1.seg[0],sizeof(int));//save text segment
 		k_am.text_seg=kv1.seg[0];
 		k_am.data_seg=kv1.seg[1];
+		memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
 		kv1.pin=1;		//确定的输入输出缓冲区为mp;
 		//call wait
 		s_wait_mm(0);
 		kv1.pin=0;k_am.sync=mp[0];
 		return;
 	case 2://首次查询全部完成
-		mp[0]=1;k_am.sync=1;
-		mp[7]=1;k_am.end0=1;
+		k_am.sync=1;//mp[0]=1;
+		k_am.end0=1;//mp[7]=1;
+//		memcpy((void*)&mp[40],(void*)&kv1.seg[1],sizeof(int));//save data segment
+//		memcpy((void*)&mp[44],(void*)&kv1.seg[0],sizeof(int));//save text segment
 		k_am.text_seg=kv1.seg[0];
 		k_am.data_seg=kv1.seg[1];
+		memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
 		kv1.pin=1;
+		s_wait_mm(0);
 		return;
 	case 10://再次查询，内核完成一次查询,传送结果给用户 再次查询的结果传送中间查询和最终查询合并，统一使用序号10
-		tp[0]=1;k_am.sync=1;
+		k_am.sync=1;//tp[0]=1;
 		//tp[7]  此时该标志只能根据mp[7]确定。
-		tp[7]=mp[7];k_am.end0=mp[7];
-		tp[8]=0;k_am.vv0[0]=0;//传送的结果。
+		k_am.end0=mp[7];//tp[7]=mp[7];
+		k_am.vv0[0]=0;//传送的结果。tp[8]=0;
 		k_am.text_seg=kv1.seg[0];
 		k_am.data_seg=kv1.seg[1];
+		memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
 		kv1.pin=2;	//缓冲区切换为tp
 		//call wait
 		s_wait_mm(1);
@@ -855,17 +860,18 @@ void s_sync(int t)
 		k_am.data_seg=kv1.seg[1];
 		if(mp[7]!=0)
 		{//此时应该自动转至最终查询
-			tp[0]=1;k_am.sync=1;
-			tp[7]=1;k_am.end0=1;
-			tp[8]=0;k_am.vv0[0]=0;
+			k_am.sync=1;//tp[0]=1;
+			k_am.end0=1;//tp[7]=1;
+			k_am.vv0[0]=0;//tp[8]=0;
+			memcpy((void*)tp,(void*)&k_am,sizeof(k_am));
 			kv1.pin=2;
 			s_wait_mm(1);
 			kv1.pin=1;
 			return;
 		}
-		mp[0]=1;k_am.sync=1;
-		mp[7]=0;k_am.end0=0;
-		mp[8]=1;k_am.vv0[0]=1;
+		k_am.sync=1;//mp[0]=1;
+		k_am.end0=0;//mp[7]=0;
+		k_am.vv0[0]=1;//mp[8]=1;
 		kv1.pin=1;
 		//call wait
 		s_wait_mm(0);
