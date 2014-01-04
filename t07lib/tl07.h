@@ -84,7 +84,7 @@ struct timeval tm;
 //{{{ define
 #define buf_size			8192
 #define adr_buf1			1024*240
-#define adr_buf2			4096
+#define adr_buf2			4096*10
 #define d_begin				192
 #define d_len				8000
 #define drv_name			"/dev/memacc_8964_dev"
@@ -290,8 +290,16 @@ int check_input(char *c);
 gpointer thd_fst(gpointer pt);
 //一个毫秒级的定时器
 void msleep();
+//再次查询按钮的响应函数。
+void on_next_srh(GtkWidget *widget,gpointer gp);
+//再次查找的线程函数
+gpointer thd_next(gpointer pt);
+//treeview3的双击响应函数
+//void on_tree3_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *col,gpointer userdata);
+//测试用，保存首次查询的地址集：
+void on_save(GtkWidget *widget,gpointer gp);
 
-
+gpointer thd_thr(gpointer pt);
 
 
 

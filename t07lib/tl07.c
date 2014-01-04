@@ -33,7 +33,9 @@ void crt_window(int a,char **b)
 	g_signal_connect(G_OBJECT(ws.window),"delete-event",G_CALLBACK(hide_window),NULL);
 //	g_signal_connect_swapped(G_OBJECT(ws.window),"destroy",G_CALLBACK(gtk_main_quit),NULL);
 	ws.thread_lock=0;ws.pid=0;ws.sn=0;
+	gdk_threads_enter();
 	gtk_main();
+	gdk_threads_leave();
 }//}}}
 //{{{ GdkPixbuf *crt_pixbuf(gchar *fname)
 GdkPixbuf *crt_pixbuf(gchar *fname)
@@ -135,6 +137,8 @@ void crt_part2()
 	gtk_fixed_put(GTK_FIXED(ws.fixed),ws.bnt[4],bnt5_px,bnt5_py);
 //添加按钮的消息响应函数
 	g_signal_connect(G_OBJECT(ws.bnt[2]),"clicked",G_CALLBACK(on_first_srh),NULL);
+	g_signal_connect(G_OBJECT(ws.bnt[3]),"clicked",G_CALLBACK(on_next_srh),NULL);
+	g_signal_connect(G_OBJECT(ws.bnt[4]),"clicked",G_CALLBACK(on_save),NULL);
 }//}}}
 //{{{ void crt_part3()
 void crt_part3()
@@ -395,13 +399,16 @@ void on_first_srh(GtkWidget *widget,gpointer gp)
 //{{{ int check_input(char *c)
 int check_input(char *c)
 {
-	int i,j;
+	int i,j,k;
 	char ch[20];
 	j=strlen(c);
 	if(j>10)
 		return 1;
 	memset(ch,0,sizeof(ch));
-	ws.sn=0;
+	if(ws.sn==0)
+		k=0;
+	else
+	{k=ws.sn;ws.sn=0;}
 //取得数据的进制类型
 	if(gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(ws.radio[0])))
 	{//十进制
@@ -440,6 +447,10 @@ int check_input(char *c)
 			}
 		}
 	}
+	if(k==ws.sn)//与上次的查询数据一样？提示下用户
+	{
+		messagebox("本次输入的查询数据与前次查询相同？？");
+	}
 	return 0;
 }//}}}
 //{{{ gpointer thd_fst(gpointer pt)
@@ -462,13 +473,17 @@ gpointer thd_fst(gpointer pt)
 	fd=open(drv_name,O_RDWR);
 	if(fd<0)
 	{
+		gdk_threads_enter();
 		messagebox("目标模块连接失败");
+		gdk_threads_leave();
 		goto thd_01;
 	}
 	i=write(fd,ws.g_ch,buf_size);//发送命令
 	if(i!=buf_size)
 	{
+		gdk_threads_enter();
 		messagebox("首次查询指令发送失败");
+		gdk_threads_leave();
 		goto thd_01;
 	}
 	msleep();
@@ -476,8 +491,32 @@ gpointer thd_fst(gpointer pt)
 	//g_timeout_add(300,(GSourceFunc),(gpointer)fd); //1second=1000
 	memset(ws.g_ch,0,buf_size);
 	c=ws.g_addr[0];k=0;
-	memset(c,0,adr_buf1);
+	memset(c,0,adr_buf1);k=0;
+	/*while(1)
+	{
+		i=read(fd,ws.g_ch,buf_size);
+		if(ws.g_ch[0]==1)
+		{
+			msleep();
+			ws.g_ch[0]=0;
+			write(fd,ws.g_ch,buf_size);
+		}
+		else
+		{
+			g_print("idle....\n");
+			write(fd,ws.g_ch,buf_size);
+		}
+		msleep();
+		if(ws.g_ch[7]==1)
+			break;
+		k++;
+		if(k>10)
+			break;
+	}
+	goto thd_01;*/
+	gdk_threads_enter();
 	gtk_list_store_clear(ws.store[2]);//先清空列表
+	gdk_threads_leave();
 	while(1)
 	{
 //f_002:	
@@ -490,11 +529,12 @@ gpointer thd_fst(gpointer pt)
 //				messagebox("不可能的错误。");
 				//break;
 //				goto f_002;
+				g_print("idle......\n");
 				continue;
 			}
 			//开始读取数据并显示。
 			ksa=(struct KVAR_SAD*)&(ws.g_ch[d_begin]);
-			for(l=0;l<1000;l++)//最多2000个地址
+			for(l=0;l<2000;l++)//最多2000个地址
 			{
 				if(ksa->spg==0 && ksa->off==0)
 					break;
@@ -507,21 +547,24 @@ gpointer thd_fst(gpointer pt)
 				memset(ch,0,sizeof(ch));
 				snprintf(ch,sizeof(ch),"0x%lx",j);
 				i=ksa->s_b.pbit;
+				gdk_threads_enter();
 				store = GTK_LIST_STORE(gtk_tree_view_get_model
 						      (GTK_TREE_VIEW(ws.list[2])));
 				gtk_list_store_append(store,&iter);
 				gtk_list_store_set(store,&iter,0,i,1,ch,-1);
+				gdk_threads_leave();
 				ksa++;
 			}
 			memset(ch,0,sizeof(ch));
 			snprintf(ch,sizeof(ch),"%d\n",k);
 			g_print(ch);
 			memcpy((void*)c,(void*)&(ws.g_ch[d_begin]),d_len);
-			c+=buf_size;k++;
+			c+=d_len;k++;
 			if(k_am->end0==1)//全部结束
 			{
 				k_am->sync=0;k_am->end0=1;//确定
 				i=write(fd,ws.g_ch,buf_size);
+				g_print("first finished!\n");
 				//if(i<0)
 				//	messagebox("向内核发送指令失败11");
 				//else
@@ -536,7 +579,9 @@ gpointer thd_fst(gpointer pt)
 			{				
 				//msleep();
 				//i=write(fd,ws.g_ch,buf_size);
+				gdk_threads_enter();
 				messagebox("向内核发送指令失败");
+				gdk_threads_leave();
 				goto thd_01;
 			}
 			msleep();
@@ -549,9 +594,9 @@ gpointer thd_fst(gpointer pt)
 		msleep();
 	}
 thd_01:
-	msleep();
 	close(fd);
 	ws.thread_lock=0;
+	msleep();
 	return 0;	
 }//}}}
 //{{{ void msleep()
@@ -561,6 +606,237 @@ void msleep()
   tm.tv_usec=300000;	//300毫秒
   select(0,NULL,NULL,NULL,&tm);
 }//}}}
+//{{{ void on_next_srh(GtkWidget *widget,gpointer gp)
+void on_next_srh(GtkWidget *widget,gpointer gp)
+{
+    GtkListStore *store;
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+	char *p;
+	if(ws.thread_lock==1)
+	{
+		messagebox("查询中....请稍后操作");
+		return;
+	}
+	if(ws.pid<1)
+	{
+		messagebox("请先选择待查询的目标进程");
+		return;
+	}
+	//查看treeview3中是否有记录？没有记录则表示还没有执行首次查找
+    store = GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(ws.list[2])));
+    model = gtk_tree_view_get_model(GTK_TREE_VIEW(ws.list[2]));
+    if (gtk_tree_model_get_iter_first(model, &iter) == FALSE)
+	{
+		messagebox("请先进行\"首次查找\"!");
+	 	return;
+	}
+    gtk_list_store_clear(store);//有记录则全部清空。
+	p=(char*)gtk_entry_get_text(GTK_ENTRY(ws.entry[0]));
+	if(check_input(p))
+	{
+		messagebox("输入的查询数据有误");
+		return;
+	}
+	g_thread_create(thd_next,NULL,FALSE,NULL);
+}//}}}
+//{{{ gpointer thd_next(gpointer pt)
+gpointer thd_next(gpointer pt)
+{
+	int i,j,k,l,fd,count;
+	char ch[20],*c,*p,*dst;
+	struct KVAR_AM *k_am;
+	struct KVAR_SAD *ksa;
+	GtkTreeIter iter;
+	GtkListStore *store;
+	ws.thread_lock=1;//锁定
+	k_am=(struct KVAR_AM *)ws.g_ch;
+	ksa=(struct KVAR_SAD*)&(ws.g_ch[d_begin]);
+	memset(ws.g_ch,0,buf_size);
+	k_am->cmd=2;					//再次查询命令字
+	k_am->pid=ws.pid;			//目标pid 
+	k_am->snum=ws.sn;			//查询关键字
+	c=(char*)&(ws.g_ch[d_begin]);//c指向输入输出缓冲区的起始位置
+	p=ws.g_addr[0];//p指向首次查询地址集的起始位置
+	dst=ws.g_addr[1];//dst指向本次查询的结果的存储位置。改位置为临时存储。在查询完成后
+	//应将本次查询的地址集再拷贝至p指向的位置。
+	memset(dst,0,adr_buf2);
+	//每次拷贝2000地址至输入输出缓冲区：
+	memset(c,0,d_len);
+	memcpy(c,p,d_len);
+	p+=d_len;count=1;//地址集的数量记录。
+	fd=open(drv_name,O_RDWR);
+	if(fd<0)
+	{
+		gdk_threads_enter();
+		messagebox("目标模块连接失败");
+		gdk_threads_leave();
+		goto thd_03;
+	}
+	i=write(fd,ws.g_ch,buf_size);//发送命令
+	if(i!=buf_size)
+	{
+		gdk_threads_enter();
+		messagebox("首次查询指令发送失败");
+		gdk_threads_leave();
+		goto thd_02;
+	}
+	msleep();k=0;
+	while(1)
+	{
+		i=read(fd,ws.g_ch,buf_size);
+		if(i==buf_size)//有数据返回
+		{
+			if(k_am->sync!=1)//内核正在查询中...轮寻等待
+			{
+				msleep();
+				continue;
+			}
+			//读出有效数据，需要分析是传出的结果地址还是需要向内核传送地址集？
+			if(k_am->vv0[0]==0)//传出的结果。此时按照模块的设计，可能产生完全退出。
+			{
+				g_print("oooooooooooooo\n");
+				if(k>4)//超过了备用缓冲区ws.g_addr[1]的大小
+				{//此时可能还有数据，但是不能保存了
+					k_am->sync=0;
+					msleep();
+					j=write(fd,ws.g_ch,buf_size);
+					if(k_am->end0==1)
+						break;//goto tnext_01;
+					else
+						continue;
+				}
+				//添加treeview列表的显示代码
+				ksa=(struct KVAR_SAD*)&(ws.g_ch[d_begin]);
+				for(l=0;l<2000;l++)//最多2000个地址
+				{
+					if(ksa->spg==0 && ksa->off==0)
+					{
+						memset(ch,0,sizeof(ch));
+						snprintf(ch,sizeof(ch),"%d times\n",l);
+						g_print(ch);
+						break;
+					}
+					if(ksa->s_b.sbit==0)//code
+						j=(int)k_am->text_seg;
+					else
+						j=(int)k_am->data_seg;
+					i=(int)ksa->s_b.pbit;i*=4096;
+					j+=i;j+=(int)ksa->off;
+					memset(ch,0,sizeof(ch));
+					snprintf(ch,sizeof(ch),"0x%lx",j);
+					i=ksa->s_b.pbit;
+					gdk_threads_enter();
+					store = GTK_LIST_STORE(gtk_tree_view_get_model
+							(GTK_TREE_VIEW(ws.list[2])));
+					gtk_list_store_append(store,&iter);
+					gtk_list_store_set(store,&iter,0,i,1,ch,-1);
+					gdk_threads_leave();
+					ksa++;
+				}
+				memcpy((void*)dst,(void*)&(ws.g_ch[d_begin]),d_len);
+				dst+=d_len;k++;
+				k_am->sync=0;
+				msleep();
+				j=write(fd,ws.g_ch,buf_size);
+				if(k_am->end0==1)//完全退出
+					break;//goto tnext_01;
+			}
+			else//需要向内核传送地址集，对于最后一块地址集，则要设置结束标志
+			{
+				memset(c,0,d_len);
+				memcpy(c,p,d_len);
+				p+=d_len;count++;
+				if(count>29)//全部地址集都读出了
+					k_am->end0=1;//结束标志。
+				else
+				{
+					memcpy((void*)&j,p,sizeof(int));
+					if(j==0)//下一页为空了
+						k_am->end0=1;
+					else
+						k_am->end0=0;
+				}
+				k_am->sync=0;
+				write(fd,ws.g_ch,buf_size);
+				msleep();
+				memset(ch,0,sizeof(ch));
+				snprintf(ch,sizeof(ch),"%d %d\n",count,k_am->end0);
+				g_print(ch);
+			}
+		}
+		msleep();
+	}
+	p=ws.g_addr[0];//p指向首次查询地址集的起始位置
+	dst=ws.g_addr[1];//dst指向本次查询的结果的存储位置。改位置为临时存储。在查询完成后
+	memset(p,0,adr_buf1);
+	memcpy(p,dst,adr_buf2);//最终查询结果必须存储在ws.g_addr[0]中。
+thd_02:
+	close(fd);
+	msleep();
+thd_03:	
+	ws.thread_lock=0;
+	g_print("thread exit!\n");
+	return 0;
+}//}}}
+//{{{ void on_save(GtkWidget *widget,gpointer gp)
+void on_save(GtkWidget *widget,gpointer gp)
+{
+	int i,fd;
+	struct KVAR_AM *k_am;
+	k_am=(struct KVAR_AM *)ws.g_ch;
+	memset(ws.g_ch,0,buf_size);
+	k_am->cmd=5;					//首次查询命令字
+	k_am->pid=ws.pid;			//目标pid 
+	k_am->snum=ws.sn;			//查询关键字
+	fd=open(drv_name,O_RDWR);
+	if(fd<0)
+	{
+		gdk_threads_enter();
+		messagebox("目标模块连接失败");
+		gdk_threads_leave();
+		return;
+	}
+	i=write(fd,ws.g_ch,buf_size);//发送命令
+	msleep();
+	close(fd);
+	return;
+	//g_thread_create(thd_thr,NULL,FALSE,NULL);
+	/*int fd,i;
+	fd=open("addr.txt",O_RDWR|O_CREAT);
+	if(fd<1)
+	{
+		messagebox("crate file error");
+		return;
+	}
+	i=write(fd,ws.g_ch,adr_buf1);
+	close(fd);
+	messagebox("write success!");*/
+}//}}}
+//{{{ gpointer thd_thr(gpointer pt)
+gpointer thd_thr(gpointer pt)
+{
+	int fd,i;
+	ws.thread_lock=1;
+	fd=open("addr.txt",O_RDWR|O_CREAT);
+	if(fd<1)
+	{
+	//	messagebox("crate file error");
+		g_print("error\n");
+		ws.thread_lock=0;
+		return;
+	}
+	i=write(fd,ws.g_ch,adr_buf1);
+	close(fd);
+	gdk_threads_enter();
+	messagebox("write success!");
+	gdk_threads_leave();
+	ws.thread_lock=0;
+	//g_print("success!\n");
+	return 0;
+}//}}}
+
+
 
 
 
@@ -619,7 +895,32 @@ void view_onRowActivated (GtkTreeView *treeview,
          g_free(name);
     }
 }
+//下列代码是测试列表框是否还有记录
+static void remove_item(GtkWidget * widget, gpointer selection)
+{
+    GtkListStore *store;
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    store = GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(list)));
+    model = gtk_tree_view_get_model(GTK_TREE_VIEW(list));
+    if (gtk_tree_model_get_iter_first(model, &iter) == FALSE)
+        return;
+    if (gtk_tree_selection_get_selected(GTK_TREE_SELECTION(selection), &model, &iter)) {
+        gtk_list_store_remove(store, &iter);
+    }
+}
 
+static void remove_all(GtkWidget * widget, gpointer selection)
+{
+    GtkListStore *store;
+    GtkTreeModel *model;
+    GtkTreeIter iter;
+    store = GTK_LIST_STORE(gtk_tree_view_get_model(GTK_TREE_VIEW(list)));
+    model = gtk_tree_view_get_model(GTK_TREE_VIEW(list));
+    if (gtk_tree_model_get_iter_first(model, &iter) == FALSE)
+        return;
+    gtk_list_store_clear(store);
+}
 
  *///}}}
 

@@ -151,10 +151,13 @@ static void class_create_release(struct class *cls);
 //首次查询的线程函数
 int first_srh(void *argc);
 int next_srh(void *argc);//再次查找的线程函数
+int update_srh(void *argc);//修改的线程函数，先用于测试。
 //一个统一的同步设置及阻塞函数。
 void s_sync(int t);
 //等待函数。
 void s_wait_mm(int w);
+//
+
 
 struct file_operations mem_fops=
 {
@@ -335,6 +338,12 @@ ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 				kernel_thread(next_srh,NULL,CLONE_KERNEL);//启动再次查询线程
 				return size;
 			}
+			if(tmp[1]==5)//测试
+			{
+				kv1.pin=1;kv1.thread_lock=1;
+				kernel_thread(update_srh,NULL,CLONE_KERNEL);
+				return size;
+			}
 			//下面还有修改，读取整页等操作。
 		}
 		else
@@ -348,7 +357,8 @@ ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 		}
 	}
 	s_wait_mm(2);
-	return 0;
+	return size;
+	//return 0;
 }//}}}
 //{{{ int first_srh(void)
 int first_srh(void *argc)
@@ -362,6 +372,7 @@ int first_srh(void *argc)
 	struct page **pages;
 	unsigned long adr;
 	struct KVAR_SAD ksa;
+	daemonize("ty_thd1");
 	v=NULL;
 	memset((void*)&mp[d_begin],0,d_len);
 	mc=&mp[d_begin];
@@ -383,7 +394,9 @@ int first_srh(void *argc)
 		printk("<1>get_task_mm error!\n");
 		goto ferr_01;
 	}
+	//vadr=mm_str->mmap->vm_next->mmap->vm_next;
 	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
+	//printk("<1>stack??:0x%lx~~~~~~~0x%lx\n",vadr->);
 	kv1.seg[0]=mm_str->start_code;
 	kv1.seg[1]=mm_str->start_data;//end_code;
 	printk("<1>code seg: 0x%lx data seg: 0x%lx\n",kv1.seg[0],kv1.seg[1]);
@@ -529,6 +542,8 @@ int first_srh(void *argc)
 	}//至此全部结束，需要将结束标志置位、取消线程锁。
 	s_sync(2);
 	kv1.thread_lock=0;//取消线程锁.退出线程
+	printk("<1>kernel_thread exit!\n");
+	do_exit(0);
 	return 0;
 ferr_01:
 //	printk("<1>ready to exit kernel_thread\n");
@@ -536,7 +551,8 @@ ferr_01:
 	kv1.thread_lock=0;
 	if(v!=NULL)
 		vfree((void*)v);
-//	printk("<1>kernel_thread finished!\n");
+	printk("<1>kernel_thread finished!\n");
+	do_exit(1);
 	return 1;
 }//}}}
 //{{{ int next_srh(void *argc)
@@ -552,6 +568,7 @@ int next_srh(void *argc)
 	struct page **pages;
 	unsigned long adr;
 	v=NULL;
+	daemonize("ty_thd2");
 //	memset((void*)&mp[d_begin],0,d_len);
 	kpid=find_get_pid(kv1.pid);
 	if(kpid==NULL)
@@ -598,17 +615,32 @@ int next_srh(void *argc)
 	{
 		while(1)
 		{
-			memset((void*)&kr,0,sizeof(kr));
+			memset((void*)&kr,0,sizeof(kr));//这种处理方式比用户端的指针处理模式差了不少，以后再改吧，不过这里的goto确实让代码逻辑简洁了许多
 			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
 			if(kr.s_b.sbit!=0)
-				break;
-			if(ret<=kr.s_b.pbit || kr.spg==0) //保证页索引没有越界,或者为空
+			{//此处表示代码段已经搜索完成。
+				if(i!=-1)//此时已经运行了kmap,所以在退出前必须进行清理
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				break;//跳出本次循环，进入代码段的查询。
+			}
+			if(ret<=kr.s_b.pbit)// || kr.spg==0) //保证页索引没有越界,或者为空
 			{
 				printk("<1>page index error101\n");
-				if(v!=NULL)
-					vfree(v);//记得释放临时申请的内存.
-				v=NULL;
-				goto nerr_01;
+				if(i!=-1)//此时已经运行了kmap,所以在退出前必须进行清理
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				//不管i等不等于-1，down_write肯定要释放的。
+				up_write(&mm_str->mmap_sem);
+				//这里不管是代码段还是数据段的搜索，执行到这里就表示地址集中已经没有数据了，要作为全部搜索完成处理！
+				mp[7]=1;
+				s_sync(12);
+				vfree(v);v=NULL;
+				goto normal_01;
 			}
 			if(i==-1)
 			{
@@ -626,7 +658,10 @@ int next_srh(void *argc)
 			if(k_am.snum<256)
 			{
 				if(k_am.sch[0]==md[kr.off])
+				{
+					printk("<1>find it!!!!!!\n");
 					k=1;
+				}
 				goto n_01; 
 			}
 			if(k_am.snum<0x10000)
@@ -656,22 +691,34 @@ n_01:
 					c=&tp[d_begin];
 				}
 			}
-			mc+=4;//传入的1000个地址查询完成，需要再次读入
+			mc+=4;//传入的2000个地址查询完成，需要再次读入
 			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
 				s_sync(12);
+				/*if(k_am.end0==1)//执行退出的清理工作。
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+					up_write(&mm_str->mmap_sem);
+					vfree(v);v=NULL;
+					goto normal_01;
+				}*/
 				mc=&mp[d_begin];				
 			}
 		}
 	}
 	up_write(&mm_str->mmap_sem);
+	printk("<1>code seg end\n");
 	if(v!=NULL)
 	{	
 		vfree(v);
 		v=NULL;pages=NULL;
 	}	
 	if(mm_str->mmap->vm_next==NULL)
+	{
+		printk("<1>data seg is NULL\n");
 		goto nerr_01;
+	}
 	len=vma_pages(mm_str->mmap->vm_next);
 	v=(char*)vmalloc(sizeof(void*)*(len+1));
 	pages=(struct page **)v;
@@ -691,15 +738,54 @@ n_01:
 		{
 			memset((void*)&kr,0,sizeof(kr));
 			memcpy((void*)&kr,mc,sizeof(kr));//获得地址。
-			if(kr.s_b.sbit!=1)
-				break;
-			if(ret<=kr.s_b.pbit) //保证页索引没有越界
+			if(kr.s_b.sbit!=1)//由于首次查询时是按照代码段，数据段的顺序搜索的，所以，在执行到数据段查询时，不会再出现非数据段的情况。
+			{//此处可作为全部查询结束处理
+				if(i!=-1)
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				mp[7]=1;
+				s_sync(12);
+				up_write(&mm_str->mmap_sem);
+				vfree(v);v=NULL;
+				printk("<1>number 1\n");
+				goto normal_01;
+				//break;//iiiiiiiiiiiiiiiiiiiiiii
+			}
+			if(ret<=kr.s_b.pbit)// || kr.spg==0) //保证页索引没有越界
 			{
 				printk("<1>page index error103\n");
-				if(v!=NULL)
-					vfree(v);//记得释放临时申请的内存.
-				v=NULL;
-				goto nerr_01;
+				if(i!=-1)//此时已经运行了kmap,所以在退出前必须进行清理
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				//不管i等不等于-1，down_write肯定要释放的。
+				up_write(&mm_str->mmap_sem);
+				//这里不管是代码段还是数据段的搜索，执行到这里就表示地址集中已经没有数据了，要作为全部搜索完成处理！
+				mp[7]=1;
+				s_sync(12);
+				vfree(v);v=NULL;
+				printk("<1>number 2\n");
+				goto normal_01;
+			}
+			if((kr.spg==0) && (kr.off==0))
+			{
+				printk("<1>next searching finished!\n");
+				if(i!=-1)//此时已经运行了kmap,所以在退出前必须进行清理
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				//不管i等不等于-1，down_write肯定要释放的。
+				up_write(&mm_str->mmap_sem);
+				//这里不管是代码段还是数据段的搜索，执行到这里就表示地址集中已经没有数据了，要作为全部搜索完成处理！
+				mp[7]=1;
+				s_sync(12);
+				vfree(v);v=NULL;
+				printk("<1>number 3\n");
+				goto normal_01;
 			}
 			if(i==-1)
 			{
@@ -717,7 +803,10 @@ n_01:
 			if(k_am.snum<256)
 			{
 				if(k_am.sch[0]==md[kr.off])
+				{
+					printk("<1>find it!!!!!!\n");
 					k=1;
+				}
 				goto n_02;
 			}
 			if(k_am.snum<0x10000)
@@ -750,30 +839,44 @@ n_02:
 			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
 				s_sync(12);
+				/*if(k_am.end0==1)//执行退出的清理工作。
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+					up_write(&mm_str->mmap_sem);
+					vfree(v);v=NULL;
+					goto normal_01;
+				}*/
 				mc=&mp[d_begin];				
 			}
 		}
 	}
 	up_write(&mm_str->mmap_sem);
+	printk("<1>data seg end!\n");
 	if(v!=NULL)
 	{	
 		vfree(v);
 		v=NULL;
 	}//写入最后剩余的地址集	
 	//确保为最终退出操作：
-	mp[7]=1;
-	s_sync(10);
+	//mp[7]=1;
+	//s_sync(10);
+normal_01:	
 	kv1.thread_lock=0;
-	return 0;
+	printk("<1>next search thread exit\n");
+	do_exit(0);
+//	return 0;
 nerr_01:
 	//错误的时候把地址缓冲清空再传送
 	memset((void*)tp,0,K_BUFFER_SIZE);
 	mp[7]=1;
-	s_sync(10);
+	s_sync(12);
 	kv1.thread_lock=0;
 	if(v!=NULL)
 		vfree((void*)v);
-	return 1;
+	printk("<1>next search thread exit111\n");
+	do_exit(1);
+//	return 1;
 }//}}}
 //{{{ void s_sync(int t)
 /*该函数可根据不同的标志字段的设置，确定标志的设置，并进入等待,等待完成后再恢复相关标志。
@@ -807,6 +910,16 @@ nerr_01:
 	（1）再次搜索的全部完成标志tp[7]=1的设置依据就是用户设置的地址集的全部输入完成标志：mp[7]=1!!
   	（2）本函数所有涉及到的mp,tp标志的设置，都是依据k_am的状态设置。也就是内核对这些标志的最好不要直接修改，而是修改k_am相关标志，而本函数完成k_am
 	到缓冲区标志的设置。 
+问题：
+	2014-1-3发现的问题，在进行"再次查找"时这个问题可能造成最后一个地址集中的部分地址没有比较就认为"再次查询"已经结束。原因就是当从用户端读取了最后
+	一页的地址集时就已经将mp[7]置位，这表示这是最后的地址集了，查询完该集"再次查询"就结束了。而此时如果存储查询结果的缓冲已满，再检查mp[7]标志就会
+	认为要进行完全退出操作，而实际上地址集中可能还有未进行比较的地址！当然这种错误不是每次出现的，只有在最后一页的地址集还没全部比较完，结果缓冲区
+	就已经满了的情况才会出现。对于这种问题的避免，我认为最简单而又最有效的方法就是在"首次查询"时记录全部查询结果（地址集）的数量。而不能按页计数。
+	这样就能保证在取得最后一页地址集进行比较时，如果此时发生了结果缓冲区满的情况，需要先判断下已经比较过的结果数量和全部数量是否有差异，小于全部数
+	量则不能做为全部完成的操作。又冒出个更精彩的想法：禁止结果缓冲输出时产生全部完成退出的操作。也即完全退出只能是在获取新的地址集时，或者该地址集
+	中出现空指针时。
+
+	------我的牛B之处就在于：我不只是通过程序测试发现某些逻辑性的问题，而是在写代码的时候就能预见和发现很多这些问题！
  */
 void s_sync(int t)
 {
@@ -842,7 +955,8 @@ void s_sync(int t)
 	case 10://再次查询，内核完成一次查询,传送结果给用户 再次查询的结果传送中间查询和最终查询合并，统一使用序号10
 		k_am.sync=1;//tp[0]=1;
 		//tp[7]  此时该标志只能根据mp[7]确定。
-		k_am.end0=mp[7];//tp[7]=mp[7];
+//		k_am.end0=mp[7];//tp[7]=mp[7];
+		k_am.end0=0;//此处改为在输送结果时永远不能产生全部退出的操作。
 		k_am.vv0[0]=0;//传送的结果。tp[8]=0;
 		k_am.text_seg=kv1.seg[0];
 		k_am.data_seg=kv1.seg[1];
@@ -850,10 +964,10 @@ void s_sync(int t)
 		kv1.pin=2;	//缓冲区切换为tp
 		//call wait
 		s_wait_mm(1);
-		if(tp[7]==0)//不是最终搜索
-			kv1.pin=0;
-		else
-			kv1.pin=1;
+//		if(tp[7]==0)//不是最终搜索
+		kv1.pin=0;
+//		else
+//			kv1.pin=1;
 		return;
 	case 12://接受用户输入的地址
 		k_am.text_seg=kv1.seg[0];
@@ -867,17 +981,24 @@ void s_sync(int t)
 			kv1.pin=2;
 			s_wait_mm(1);
 			kv1.pin=1;
+			memset((void*)&k_am,0,sizeof(k_am));
 			return;
 		}
 		k_am.sync=1;//mp[0]=1;
 		k_am.end0=0;//mp[7]=0;
 		k_am.vv0[0]=1;//mp[8]=1;
+		memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
 		kv1.pin=1;
 		//call wait
 		s_wait_mm(0);
 		mp[8]=0;k_am.vv0[0]=0;
 		kv1.pin=0;
 		return;
+	case 13://测试
+		k_am.sync=1;k_am.end0=1;
+		memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
+		s_wait_mm(0);
+		kv1.pin=1;
 	default:
 		printk("<1>error combo\n");
 		break;
@@ -913,6 +1034,42 @@ void s_wait_mm(int w)
 		sleep_on_timeout(&whead,200);
 	}
 }//}}}
+//{{{ int update_srh(void *argc)
+int update_srh(void *argc)
+{
+	struct pid *kpid;
+	struct task_struct *t_str;
+	struct mm_struct *mm_str;
+	struct vm_area_struct *vadr1,*vadr2;
+	daemonize("ty_thd3");
+	kpid=find_get_pid(kv1.pid);
+	if(kpid==NULL)
+	{
+		printk("<1>find_get_pid error\n");
+		goto uerr_01;
+	}
+	t_str=pid_task(kpid,PIDTYPE_PID);
+	if(t_str==NULL)
+	{
+		printk("<1>pid_task error\n");
+		goto uerr_01;
+	}
+	mm_str=get_task_mm(t_str);
+	if(mm_str==NULL)
+	{
+		printk("<1>get_task_mm error\n");
+		goto uerr_01;
+	}
+	printk("<1>pid:%d data addr is: 0x%lx code addr is: 0x%lx stack is: 0x%lx\n",kv1.pid,mm_str->start_data,mm_str->start_code,mm_str->start_stack);
+	vadr1=mm_str->mmap->vm_next;vadr2=vadr1->vm_next;
+	printk("<1>0x%ld   0x%ld    0x%ld\n",mm_str->mmap->vm_start,vadr1->vm_start,vadr2->vm_start);
+uerr_01:
+	//s_sync(13);
+	kv1.thread_lock=0;
+	return 0;
+}//}}}
+
+
 
 //{{{ void class_create_release(struct class *cls)
 void class_create_release(struct class *cls)
