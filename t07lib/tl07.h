@@ -24,6 +24,8 @@ struct win_struct
 	char	  *g_addr[2]; //两个结果地址缓冲
 	int		  pid;		//进程pid
 	int		  sn;		//查找数字
+	unsigned int  dseg;
+	unsigned int  bseg;//text seg
 };
 struct win_struct ws;
 //定义一个与模块相关的结构。
@@ -78,8 +80,16 @@ struct KVAR_AM
     };
     struct KVAR_ADDR vadd[8];           //8个锁定（修改）数据和地址。 
 };
-
+struct SAVE_LOCK
+{
+	char ch[40];
+	struct KVAR_ADDR add;
+};
 struct KVAR_SAD	 ksa;
+struct KVAR_AM	 kam;
+int idx;
+char doff[40];
+struct SAVE_LOCK sl[8];
 struct timeval tm;
 //{{{ define
 #define buf_size			8192
@@ -295,17 +305,21 @@ void on_next_srh(GtkWidget *widget,gpointer gp);
 //再次查找的线程函数
 gpointer thd_next(gpointer pt);
 //treeview3的双击响应函数
-//void on_tree3_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *col,gpointer userdata);
+void on_tree3_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *col,gpointer userdata);
 //测试用，保存首次查询的地址集：
 void on_save(GtkWidget *widget,gpointer gp);
-
+//锁定指定地址数据的线程。
 gpointer thd_thr(gpointer pt);
-
-
-
-
-
-
+//按钮"添加锁定"的响应函数，测试取得treeview的记录条数
+void on_addlock(GtkWidget *widget,gpointer gp);
+//按钮"删除锁定"的响应函数，测试取得记录的内容
+void on_dellock(GtkWidget *widget,gpointer gp);
+//锁定信息的输入检查函数。
+int check_lock(char *c);
+//开始锁定
+void on_lock(GtkWidget *widget,gpointer gp);
+//地址转换
+int tonum(char *c,unsigned int *ui);
 
 
 //}}}

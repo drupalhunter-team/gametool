@@ -152,6 +152,7 @@ static void class_create_release(struct class *cls);
 int first_srh(void *argc);
 int next_srh(void *argc);//再次查找的线程函数
 int update_srh(void *argc);//修改的线程函数，先用于测试。
+int lock_srh(void *argc);//修改的线程函数。
 //一个统一的同步设置及阻塞函数。
 void s_sync(int t);
 //等待函数。
@@ -287,6 +288,7 @@ ssize_t mem_read(struct file *filp,char *buf,size_t size,loff_t *fpos)
 //{{{ ssize_t mem_write(struct file *filp,char *buf,size_t size,loff_t *fpos)
 ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 {
+	unsigned long i,j;
 	int res;
 	char *tmp;
 	if(mp==NULL ||tp==NULL)
@@ -336,6 +338,21 @@ ssize_t mem_write(struct file *filp,const char *buf,size_t size,loff_t *fpos)
 				tmp[0]=0;tmp[7]=0;tmp[8]=0;
 				kv1.pin=0;kv1.thread_lock=1;
 				kernel_thread(next_srh,NULL,CLONE_KERNEL);//启动再次查询线程
+				return size;
+			}
+			if(tmp[1]==3)//锁定
+			{
+				j=0;
+				if(k_am.vadd[0].ksa.s_b.sbit==0)
+					j=kv1.seg[0];
+				else
+					j=kv1.seg[1];
+				i=k_am.vadd[0].ksa.s_b.pbit*4096;
+				i+=k_am.vadd[0].ksa.off;
+				j+=i;
+				printk("<1>addr=0x%lx  num=%d\n",j,k_am.vadd[0].mind);
+				kv1.pin=1;kv1.thread_lock=1;//锁定操作最主要的设置就是kv1.pin=1;保证接收缓冲区为mp
+				kernel_thread(lock_srh,NULL,CLONE_KERNEL);//启动锁定线程
 				return size;
 			}
 			if(tmp[1]==5)//测试
@@ -397,14 +414,15 @@ int first_srh(void *argc)
 	//vadr=mm_str->mmap->vm_next->mmap->vm_next;
 	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
 	//printk("<1>stack??:0x%lx~~~~~~~0x%lx\n",vadr->);
-	kv1.seg[0]=mm_str->start_code;
+	kv1.seg[0]=mm_str->start_brk;//mm_str->start_code; 2014-1-4修改
 	kv1.seg[1]=mm_str->start_data;//end_code;
 	printk("<1>code seg: 0x%lx data seg: 0x%lx\n",kv1.seg[0],kv1.seg[1]);
 	n=0;
 	for(m=0;m<2;m++)
 	{//段的循环，只查询代码段和数据段。
-		if(m==0)
-			vadr=mm_str->mmap;
+		if(m==0)//2014-1-4修改为检索堆空间
+			//vadr=mm_str->mmap;
+			vadr=mm_str->mmap->vm_next->vm_next;
 		else
 			vadr=mm_str->mmap->vm_next;
 		adr=vadr->vm_start;
@@ -543,7 +561,6 @@ int first_srh(void *argc)
 	s_sync(2);
 	kv1.thread_lock=0;//取消线程锁.退出线程
 	printk("<1>kernel_thread exit!\n");
-	do_exit(0);
 	return 0;
 ferr_01:
 //	printk("<1>ready to exit kernel_thread\n");
@@ -552,7 +569,6 @@ ferr_01:
 	if(v!=NULL)
 		vfree((void*)v);
 	printk("<1>kernel_thread finished!\n");
-	do_exit(1);
 	return 1;
 }//}}}
 //{{{ int next_srh(void *argc)
@@ -564,7 +580,7 @@ int next_srh(void *argc)
 	struct pid *kpid;
 	struct task_struct *t_str;
 	struct mm_struct *mm_str;
-//	struct vm_area_struct *vadr;
+	struct vm_area_struct *vadr;
 	struct page **pages;
 	unsigned long adr;
 	v=NULL;
@@ -589,13 +605,15 @@ int next_srh(void *argc)
 		goto nerr_01;
 	}
 	printk("<1>pid: %d data addr is: 0x%lx~~~~0x%lx\n",kv1.pid,mm_str->start_data,mm_str->end_data);
-	kv1.seg[0]=mm_str->start_code;
+	kv1.seg[0]=mm_str->start_brk;//mm_str->start_code; 2014-1-4修改
 	kv1.seg[1]=mm_str->start_data;
 //两个极为关键的设置：c->指向结果缓冲区 mc->指向地址集	
 	c=&tp[d_begin];mc=&mp[d_begin];
 	memset((void*)c,0,d_len);
 //	len=vma_pages(mm_str->mmap->vm_next);
-	len=vma_pages(mm_str->mmap);
+	vadr=mm_str->mmap->vm_next->vm_next;
+	//len=vma_pages(mm_str->mmap); //2014-1-4修改
+	len=vma_pages(vadr);
 	if(v==NULL)
 	{
 		v=(char*)vmalloc(sizeof(void*)*(len+1));
@@ -606,7 +624,8 @@ int next_srh(void *argc)
 			goto nerr_01;
 		}
 	}
-	adr=mm_str->mmap->vm_start;
+	//adr=mm_str->mmap->vm_start; 2014-1-4修改
+	adr=vadr->vm_start;
 	memset((void*)pages,0,sizeof(void*)*(len+1));
 	down_write(&mm_str->mmap_sem);
 	ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
@@ -625,6 +644,23 @@ int next_srh(void *argc)
 					page_cache_release(pages[i]);
 				}
 				break;//跳出本次循环，进入代码段的查询。
+			}
+			if((kr.spg==0) && (kr.off==0))
+			{
+				printk("<1>next searching finished!\n");
+				if(i!=-1)//此时已经运行了kmap,所以在退出前必须进行清理
+				{
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+				}
+				//不管i等不等于-1，down_write肯定要释放的。
+				up_write(&mm_str->mmap_sem);
+				//这里不管是代码段还是数据段的搜索，执行到这里就表示地址集中已经没有数据了，要作为全部搜索完成处理！
+				mp[7]=1;
+				s_sync(12);
+				vfree(v);v=NULL;
+				printk("<1>number 4\n");
+				goto normal_01;
 			}
 			if(ret<=kr.s_b.pbit)// || kr.spg==0) //保证页索引没有越界,或者为空
 			{
@@ -659,7 +695,7 @@ int next_srh(void *argc)
 			{
 				if(k_am.sch[0]==md[kr.off])
 				{
-					printk("<1>find it!!!!!!\n");
+					//printk("<1>find it!!!!!!\n");
 					k=1;
 				}
 				goto n_01; 
@@ -695,14 +731,6 @@ n_01:
 			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
 				s_sync(12);
-				/*if(k_am.end0==1)//执行退出的清理工作。
-				{
-					kunmap(pages[i]);
-					page_cache_release(pages[i]);
-					up_write(&mm_str->mmap_sem);
-					vfree(v);v=NULL;
-					goto normal_01;
-				}*/
 				mc=&mp[d_begin];				
 			}
 		}
@@ -804,7 +832,7 @@ n_01:
 			{
 				if(k_am.sch[0]==md[kr.off])
 				{
-					printk("<1>find it!!!!!!\n");
+					//printk("<1>find it!!!!!!\n");
 					k=1;
 				}
 				goto n_02;
@@ -839,14 +867,6 @@ n_02:
 			if(mc-&mp[d_begin]>7996)
 			{//注意，此时tp中可能已经有了本次的查询结果，所以，应禁止对tp的任何改动
 				s_sync(12);
-				/*if(k_am.end0==1)//执行退出的清理工作。
-				{
-					kunmap(pages[i]);
-					page_cache_release(pages[i]);
-					up_write(&mm_str->mmap_sem);
-					vfree(v);v=NULL;
-					goto normal_01;
-				}*/
 				mc=&mp[d_begin];				
 			}
 		}
@@ -864,8 +884,7 @@ n_02:
 normal_01:	
 	kv1.thread_lock=0;
 	printk("<1>next search thread exit\n");
-	do_exit(0);
-//	return 0;
+	return 0;
 nerr_01:
 	//错误的时候把地址缓冲清空再传送
 	memset((void*)tp,0,K_BUFFER_SIZE);
@@ -875,8 +894,7 @@ nerr_01:
 	if(v!=NULL)
 		vfree((void*)v);
 	printk("<1>next search thread exit111\n");
-	do_exit(1);
-//	return 1;
+	return 1;
 }//}}}
 //{{{ void s_sync(int t)
 /*该函数可根据不同的标志字段的设置，确定标志的设置，并进入等待,等待完成后再恢复相关标志。
@@ -951,6 +969,11 @@ void s_sync(int t)
 		memcpy((void*)mp,(void*)&k_am,sizeof(k_am));
 		kv1.pin=1;
 		s_wait_mm(0);
+		return;
+	case 3://锁定目标数据,注意：与查询操作不同，该操作的退出是被动的，所以不能设置
+		//k_am.sync=1，
+		kv1.pin=1;
+		s_wait_mm(2);//只需休眠1秒，然后由线程代码判断end0是否等于1。确定是否退出.
 		return;
 	case 10://再次查询，内核完成一次查询,传送结果给用户 再次查询的结果传送中间查询和最终查询合并，统一使用序号10
 		k_am.sync=1;//tp[0]=1;
@@ -1068,7 +1091,409 @@ uerr_01:
 	kv1.thread_lock=0;
 	return 0;
 }//}}}
-
+//{{{ int lock_srh()
+int lock_srh(void *argc)
+{
+	struct pid *kpid;
+	struct task_struct *t_str;
+	struct mm_struct *mm_str;
+	struct vm_area_struct *vadr;
+	struct page **pages;
+	struct KVAR_AM *k_am;
+	struct KVAR_SAD *ksa;
+	char *v,*c;
+	int i,k,ret,len;
+	unsigned long adr;
+	v=NULL;k=0;
+	c=mp;
+	daemonize("ty_thd4");
+	k_am=(struct KVAR_AM *)mp;
+	/*for(i=0;i<8;i++)
+	{
+		memset((void*)&k1[i],0,sizeof(struct KVAR_SAD));
+		memset((void*)&k2[i],0,sizeof(struct KVAR_SAD));
+		ksa=(struct KVAR_SAD*)&(k_am->vadd[i].ksa);
+		if(ksa->s_b.sbit==0)//堆段在k1
+		{
+			memcpy((void*)&k1[i],(void*)ksa,sizeof(struct KVAR_SAD));
+			if(m1>ksa->s_b.pbit)
+				m1=ksa->s_b.pbit;
+		}
+		else
+		{
+			memcpy((void*)&k2[i],(void*)ksa,sizeof(struct KVAR_SAD));
+			if(m2>ksa->s_b.pbit)
+				m2=ksa->s_b.pbit;
+		}
+	}*/
+	kpid=find_get_pid(kv1.pid);
+	if(kpid==NULL)
+	{
+		printk("<1>find_get_pid error\n");
+		goto lerr_01;
+	}
+	t_str=pid_task(kpid,PIDTYPE_PID);
+	if(t_str==NULL)
+	{
+		printk("<1>pid_task error\n");
+		goto lerr_01;
+	}
+	mm_str=get_task_mm(t_str);
+	if(mm_str==NULL)
+	{
+		printk("<1>get_task_mm error\n");
+		goto lerr_01;
+	}
+	if(k_am->vadd[0].ksa.s_b.sbit==0)
+		vadr=mm_str->mmap->vm_next->vm_next;
+	else
+		vadr=mm_str->mmap->vm_next;
+	adr=vadr->vm_start;
+	len=vma_pages(vadr);
+	if(v==NULL)
+	{
+		v=(char*)vmalloc(sizeof(void*)*(len+1));
+	}
+	pages=(struct page **)v;
+	if(pages==NULL)
+	{
+		printk("<1>kmalloc error31\n");
+		goto lerr_01;
+	}
+	memset((void*)pages,0,sizeof(void*)*(len+1));
+	down_write(&mm_str->mmap_sem);
+	ksa=(struct KVAR_SAD *)&(k_am->vadd[0].ksa);
+	ret=get_user_pages(current,mm_str,adr,len,0,0,pages,NULL);
+	if(ret<=ksa->s_b.pbit)
+	{
+		printk("<1>page index error\n");
+		up_write(&mm_str->mmap_sem);
+		goto lerr_01;
+	}
+	i=ksa->s_b.pbit;
+	while(1)
+	{
+		c=kmap(pages[i]);
+		c[ksa->off]=k_am->vadd[0].mind;
+		kunmap(pages[i]);
+		//page_cache_release(pages[i]);
+		s_sync(3);
+		if(k_am->end0==1)//退出！
+		{
+			page_cache_release(pages[i]);
+			up_write(&mm_str->mmap_sem);
+			goto lerr_01;
+		}
+		s_sync(3);
+	}
+	/*while(1)
+	{
+		for(k=0;k<8;k++)
+		{
+			if((k_am->vadd[k].ksa.spg)==0 && (k_am->vadd[k].ksa.off==0))
+				break;
+		}//k保存了实际要锁定地址的个数
+		//j=k_am->vadd[0].ksa.s_b.sbit;//j确定了首个锁定地址所在的段。
+		//if(j==1)//锁定地址没有堆的，直接跳转至数据段
+		//	goto lnor_01;
+		//首先进行堆的查询:(原来的代码段)
+		vadr=mm_str->mmap->vm_next->vm_next;
+		adr=vadr->vm_start;
+		len=vma_pages(vadr);
+		if(v==NULL)
+		{
+			v=(char*)vmalloc(sizeof(void*)*(len+1));
+		}
+		pages=(struct page **)v;
+		if(pages==NULL)
+		{
+			printk("<1>kmalloc error31\n");
+			goto lerr_01;
+		}
+		memset((void*)pages,0,sizeof(void*)*10);
+		down_write(&mm_str->mmap_sem);
+		ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
+		if(ret>0)
+		{
+			i=-1;
+			for(j=0;j<k;j++)
+			{//这里是堆的判断和修改。所以j已经没有必要了
+				ksa=&(k_am->vadd[j].ksa);
+				if(ksa->s_b.sbit!=0)//地址不在堆中了。
+				{
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+						i=-1;
+					}
+					continue;
+					//up_write(&mm_str->mmap_sem);
+					//goto lnor_01;
+				}
+				if(ksa->spg==0 && ksa->off==0)
+				{//因为有k的限制，流程不可能到达这里的，还是写上吧。
+					printk("<1>it's impossible! you shouldn't be here neo\n");
+					//既然到这里了，就认为全部锁定完成。
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+					}
+					up_write(&mm_str->mmap_sem);
+					goto lerr_01;
+				}
+				if(ret<=ksa->s_b.pbit || ksa->off>4096)
+				{//第三项检查:页索引和页内偏移的检查。这里也是不应到达的
+					printk("<1>there is another station00oo!\n");
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+					}
+					up_write(&mm_str->mmap_sem);
+					goto lerr_01;
+				}
+				if(i==-1)
+				{
+					i=ksa->s_b.pbit;
+					c=(char*)kmap(pages[i]);
+				}
+				if(i!=ksa->s_b.pbit)
+				{//不在同一页上，需要重新映射。
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+					i=ksa->s_b.pbit;
+					c=(char*)kmap(pages[i]);
+				}
+				m=k_am->vadd[j].mind;
+				if(m!=0)//数据修改规则：下限不为0则以大于下限为准
+				{
+					if(m<0x100)//一字节
+					{
+						if(c[ksa->off]<m)
+						{
+							c[ksa->off]=(char)m;
+						}
+						continue;
+					}
+					if(m<0x10000)//2字节
+					{
+						n=0;
+						memcpy((void*)&n,(void*)&c[ksa->off],2);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,2);
+						continue;
+					}
+					if(m<0x1000000)//3字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],3);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,3);
+						continue;
+					}
+					if(m<0xffffffff)//4字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],4);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,4);
+					}
+					continue;
+				}
+				else//下限为0,则以小于上限为准
+				{
+					m=k_am->vadd[j].maxd;
+					if(m<0x100)//一字节
+					{//这里的处理不太合理，因为内存的数据如果已经是2字节的数字，
+						//这样处理就不合理了。下同，先记下，以后完善。
+						if(c[ksa->off]>m)
+						{
+							c[ksa->off]=(char)m;
+						}
+						continue;
+					}
+					if(m<0x10000)//2字节
+					{
+						n=0;
+						memcpy((void*)&n,(void*)&c[ksa->off],2);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,2);
+						continue;
+					}
+					if(m<0x1000000)//3字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],3);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,3);
+						continue;
+					}
+					if(m<0xffffffff)//4字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],4);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,4);
+					}
+					continue;
+				}
+			}
+		}//至此，完成了全部堆中地址的锁定。开始进行数据段地址的锁定。
+		up_write(&mm_str->mmap_sem);
+//lnor_01:
+		if(v!=NULL)
+		{	vfree(v);v=NULL;}
+		//if(k<=0)//全部地址都已经锁定了，检查是否直接退出。
+		//	goto lnor_02;	
+		vadr=mm_str->mmap->vm_next;
+		adr=vadr->vm_start;
+		len=vma_pages(vadr);
+		v=(char*)vmalloc(sizeof(void*)*(len+1));
+		pages=(struct page **)v;
+		if(pages==NULL)
+		{
+			printk("<1>kmalloc error312\n");
+			goto lerr_01;
+		}
+		memset((void*)pages,0,sizeof(void*)*10);
+		down_write(&mm_str->mmap_sem);
+		ret=get_user_pages(t_str,mm_str,adr,len,0,0,pages,NULL);
+		if(ret>0)
+		{
+			i=-1;
+			for(j=0;j<k;j++)
+			{//这里是堆的判断和修改。所以j已经没有必要了
+				ksa=&(k_am->vadd[j].ksa);
+				if(ksa->s_b.sbit!=1)//地址不在堆中了。
+				{
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+						i=-1;
+					}
+					continue;
+					//up_write(&mm_str->mmap_sem);
+					//goto lnor_02;
+				}
+				if(ksa->spg==0 && ksa->off==0)
+				{//因为有k的限制，流程不可能到达这里的，还是写上吧。
+					printk("<1>it's impossible! you shouldn't be here neo\n");
+					//既然到这里了，就认为全部锁定完成。
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+					}
+					up_write(&mm_str->mmap_sem);
+					goto lerr_01;
+				}
+				if(ret<=ksa->s_b.pbit || ksa->off>4096)
+				{//第三项检查:页索引和页内偏移的检查。这里也是不应到达的
+					printk("<1>there is another station!\n");
+					if(i!=-1)
+					{
+						kunmap(pages[i]);
+						page_cache_release(pages[i]);
+					}
+					up_write(&mm_str->mmap_sem);
+					goto lerr_01;
+				}
+				if(i==-1)
+				{
+					i=ksa->s_b.pbit;
+					c=(char*)kmap(pages[i]);
+				}
+				if(i!=ksa->s_b.pbit)
+				{//不在同一页上，需要重新映射。
+					kunmap(pages[i]);
+					page_cache_release(pages[i]);
+					i=ksa->s_b.pbit;
+					c=(char*)kmap(pages[i]);
+				}
+				m=k_am->vadd[j].mind;
+				if(m!=0)//数据修改规则：下限不为0则以大于下限为准
+				{
+					if(m<0x100)//一字节
+					{
+						if(c[ksa->off]<m)
+						{
+							c[ksa->off]=(char)m;
+						}
+						continue;
+					}
+					if(m<0x10000)//2字节
+					{
+						n=0;
+						memcpy((void*)&n,(void*)&c[ksa->off],2);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,2);
+						continue;
+					}
+					if(m<0x1000000)//3字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],3);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,3);
+						continue;
+					}
+					if(m<0xffffffff)//4字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],4);
+						if(n<m)
+							memcpy((void*)&c[ksa->off],(void*)&m,4);
+					}
+					continue;
+				}
+				else//下限为0,则以小于上限为准
+				{
+					m=k_am->vadd[j].maxd;
+					if(m<0x100)//一字节
+					{//这里的处理不太合理，因为内存的数据如果已经是2字节的数字，
+						//这样处理就不合理了。下同，先记下，以后完善。
+						if(c[ksa->off]>m)
+						{
+							c[ksa->off]=(char)m;
+						}
+						continue;
+					}
+					if(m<0x10000)//2字节
+					{
+						n=0;
+						memcpy((void*)&n,(void*)&c[ksa->off],2);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,2);
+						continue;
+					}
+					if(m<0x1000000)//3字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],3);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,3);
+						continue;
+					}
+					if(m<0xffffffff)//4字节
+					{
+						n=0;memcpy((void*)&n,(void*)&c[ksa->off],4);
+						if(n>m)
+							memcpy((void*)&c[ksa->off],(void*)&m,4);
+					}
+					continue;
+				}
+			}
+		}
+		up_write(&mm_str->mmap_sem);
+//lnor_02:
+		//这里进行是否持续锁定的判断。注意：这里和两个查询线程不同的是退出不是主动的
+		//而是根据用户的设定确定退出的。
+		s_sync(3);
+		if(k_am->end0==1)//退出！
+			goto lerr_01;
+	}*/
+lerr_01:
+	if(v!=NULL)
+		vfree(v);
+	kv1.thread_lock=0;	
+	return 0;
+}//}}}
 
 
 //{{{ void class_create_release(struct class *cls)

@@ -24,15 +24,17 @@ void crt_window(int a,char **b)
 	crt_part2();
 	crt_part3();
 	memset(ch,0,36);
-	gtk_list_store_append(ws.store[1],&iter);
-	gtk_list_store_set(ws.store[1],&iter,0,"生   命   值",1,"0x884893823",2,155,3,245,-1);
-	gtk_list_store_append(ws.store[1],&iter);
-	gtk_list_store_set(ws.store[1],&iter,0,"武器1",1,"0x884920230",2,16,-1);
+	//gtk_list_store_append(ws.store[1],&iter);
+	//gtk_list_store_set(ws.store[1],&iter,0,"生   命   值",1,"0x884893823",2,155,3,245,-1);
+	//gtk_list_store_append(ws.store[1],&iter);
+	//gtk_list_store_set(ws.store[1],&iter,0,"武器1",1,"0x884920230",2,16,-1);
 	crt_statusicon();
 	gtk_widget_show_all(ws.window);
 	g_signal_connect(G_OBJECT(ws.window),"delete-event",G_CALLBACK(hide_window),NULL);
 //	g_signal_connect_swapped(G_OBJECT(ws.window),"destroy",G_CALLBACK(gtk_main_quit),NULL);
 	ws.thread_lock=0;ws.pid=0;ws.sn=0;
+	for(i=0;i<8;i++)
+		memset((void*)&sl[i],0,sizeof(sl[i]));
 	gdk_threads_enter();
 	gtk_main();
 	gdk_threads_leave();
@@ -211,7 +213,7 @@ void crt_part3()
 	model=GTK_TREE_MODEL(ws.store[2]);
 	ws.list[2]=gtk_tree_view_new_with_model(model);
 	render=gtk_cell_renderer_text_new();
-	column=gtk_tree_view_column_new_with_attributes("页序号",render,"text",0,NULL);
+	column=gtk_tree_view_column_new_with_attributes("序    号",render,"text",0,NULL);
 	gtk_tree_view_append_column(GTK_TREE_VIEW(ws.list[2]),column);
 	render=gtk_cell_renderer_text_new();
 	column=gtk_tree_view_column_new_with_attributes("扫描地址",render,"text",1,NULL);
@@ -221,6 +223,12 @@ void crt_part3()
 	ws.scroll[1]=gtk_vscrollbar_new(gtk_tree_view_get_vadjustment(GTK_TREE_VIEW(ws.list[2])));
 	gtk_widget_set_size_request(ws.scroll[1],srl2_w,srl2_h);
 	gtk_fixed_put(GTK_FIXED(ws.fixed),ws.scroll[1],srl2_px,srl2_py);
+	//消息响应
+	g_signal_connect(G_OBJECT(ws.bnt[5]),"clicked",G_CALLBACK(on_addlock),NULL);
+	g_signal_connect(G_OBJECT(ws.bnt[6]),"clicked",G_CALLBACK(on_dellock),NULL);
+	g_signal_connect(G_OBJECT(ws.bnt[8]),"clicked",G_CALLBACK(on_lock),NULL);
+	g_signal_connect(G_OBJECT(ws.list[2]),"row-activated",G_CALLBACK(on_tree3_dblclk),NULL);
+
 
 }//}}}
 //{{{ void on_getproc(GtkWidget *widget,gpointer gp)
@@ -294,7 +302,6 @@ void on_tree1_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *
 		gtk_tree_model_get_value(model,&iter,1,&value);
 		memset(ch,0,sizeof(ch));
 		snprintf(ch,sizeof(ch),labi,g_value_get_string(&value));
-		//g_value_unset(&value);
 		gtk_label_set_markup(GTK_LABEL(ws.label),ch);
 	}
 }//}}}
@@ -456,7 +463,7 @@ int check_input(char *c)
 //{{{ gpointer thd_fst(gpointer pt)
 gpointer thd_fst(gpointer pt)
 {
-	int i,j,k,l,fd;
+	int i,j,k,l,m,fd;
 	char ch[20],*c;
 	struct KVAR_AM *k_am;
 	struct KVAR_SAD *ksa;
@@ -516,7 +523,7 @@ gpointer thd_fst(gpointer pt)
 	goto thd_01;*/
 	gdk_threads_enter();
 	gtk_list_store_clear(ws.store[2]);//先清空列表
-	gdk_threads_leave();
+	gdk_threads_leave();m=0;
 	while(1)
 	{
 //f_002:	
@@ -551,9 +558,9 @@ gpointer thd_fst(gpointer pt)
 				store = GTK_LIST_STORE(gtk_tree_view_get_model
 						      (GTK_TREE_VIEW(ws.list[2])));
 				gtk_list_store_append(store,&iter);
-				gtk_list_store_set(store,&iter,0,i,1,ch,-1);
+				gtk_list_store_set(store,&iter,0,m,1,ch,-1);
 				gdk_threads_leave();
-				ksa++;
+				ksa++;m++;
 			}
 			memset(ch,0,sizeof(ch));
 			snprintf(ch,sizeof(ch),"%d\n",k);
@@ -595,6 +602,8 @@ gpointer thd_fst(gpointer pt)
 	}
 thd_01:
 	close(fd);
+	ws.dseg=k_am->data_seg;
+	ws.bseg=k_am->text_seg;
 	ws.thread_lock=0;
 	msleep();
 	return 0;	
@@ -643,7 +652,7 @@ void on_next_srh(GtkWidget *widget,gpointer gp)
 //{{{ gpointer thd_next(gpointer pt)
 gpointer thd_next(gpointer pt)
 {
-	int i,j,k,l,fd,count;
+	int i,j,k,l,m,fd,count;
 	char ch[20],*c,*p,*dst;
 	struct KVAR_AM *k_am;
 	struct KVAR_SAD *ksa;
@@ -681,7 +690,7 @@ gpointer thd_next(gpointer pt)
 		gdk_threads_leave();
 		goto thd_02;
 	}
-	msleep();k=0;
+	msleep();k=0;m=0;
 	while(1)
 	{
 		i=read(fd,ws.g_ch,buf_size);
@@ -730,9 +739,9 @@ gpointer thd_next(gpointer pt)
 					store = GTK_LIST_STORE(gtk_tree_view_get_model
 							(GTK_TREE_VIEW(ws.list[2])));
 					gtk_list_store_append(store,&iter);
-					gtk_list_store_set(store,&iter,0,i,1,ch,-1);
+					gtk_list_store_set(store,&iter,0,m,1,ch,-1);
 					gdk_threads_leave();
-					ksa++;
+					ksa++;m++;
 				}
 				memcpy((void*)dst,(void*)&(ws.g_ch[d_begin]),d_len);
 				dst+=d_len;k++;
@@ -782,7 +791,8 @@ thd_03:
 //{{{ void on_save(GtkWidget *widget,gpointer gp)
 void on_save(GtkWidget *widget,gpointer gp)
 {
-	int i,fd;
+	messagebox("测试版本，暂时无法保存锁定地址");
+	/*int i,fd;
 	struct KVAR_AM *k_am;
 	k_am=(struct KVAR_AM *)ws.g_ch;
 	memset(ws.g_ch,0,buf_size);
@@ -802,7 +812,7 @@ void on_save(GtkWidget *widget,gpointer gp)
 	close(fd);
 	return;
 	//g_thread_create(thd_thr,NULL,FALSE,NULL);
-	/*int fd,i;
+	int fd,i;
 	fd=open("addr.txt",O_RDWR|O_CREAT);
 	if(fd<1)
 	{
@@ -818,30 +828,272 @@ gpointer thd_thr(gpointer pt)
 {
 	int fd,i;
 	ws.thread_lock=1;
-	fd=open("addr.txt",O_RDWR|O_CREAT);
-	if(fd<1)
-	{
-	//	messagebox("crate file error");
-		g_print("error\n");
-		ws.thread_lock=0;
-		return;
-	}
-	i=write(fd,ws.g_ch,adr_buf1);
-	close(fd);
-	gdk_threads_enter();
-	messagebox("write success!");
-	gdk_threads_leave();
+
 	ws.thread_lock=0;
-	//g_print("success!\n");
 	return 0;
 }//}}}
-
-
-
-
-
-
-
+//{{{ void on_tree3_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *col,gpointer userdata)
+void on_tree3_dblclk(GtkTreeView *treeview,GtkTreePath *path,GtkTreeViewColumn *col,gpointer userdata)
+{
+	GtkTreeModel *model;
+	GtkTreeIter iter;
+	GValue value;
+	memset((void*)&value,0,sizeof(value));
+	model=gtk_tree_view_get_model(treeview);
+	if(gtk_tree_model_get_iter(model,&iter,path))
+	{//idx和doff分别为全局变量，保存用户的选择。
+		gtk_tree_model_get_value(model,&iter,0,&value);
+		idx=g_value_get_int(&value);//get pid
+		g_value_unset(&value);
+		gtk_tree_model_get_value(model,&iter,1,&value);
+		memset(doff,0,sizeof(doff));
+		snprintf(doff,sizeof(doff),"%s",g_value_get_string(&value));
+		gtk_entry_set_text(GTK_ENTRY(ws.entry[2]),doff);
+	}
+}//}}}
+//{{{ void on_addlock(GtkWidget *widget,gpointer gp)
+void on_addlock(GtkWidget *widget,gpointer gp)
+{
+	check_lock(doff);
+	/*GtkTreeModel *model;
+	GtkTreeIter	  iter;
+	gboolean      bl;
+	char ch[100];
+	int count;
+	count=0;
+	model=gtk_tree_view_get_model(GTK_TREE_VIEW(ws.list[1]));
+	bl=gtk_tree_model_get_iter_first(model,&iter);
+	while(bl)
+	{
+		count++;
+		bl=gtk_tree_model_iter_next(model,&iter);
+	}
+	memset(ch,0,sizeof(ch));
+	snprintf(ch,sizeof(ch),"row counts=%d",count);
+	messagebox(ch);*/
+}//}}}
+//{{{ void on_dellock(GtkWidget *widget,gpointer gp)
+void on_dellock(GtkWidget *widget,gpointer gp)
+{
+	GtkTreeModel *model;
+	GtkTreeIter	  iter;
+	GtkTreeSelection *sel;
+	gchar *str[2];
+	gint  gin[2];
+	char  ch[100];
+	int i,j;
+	sel=gtk_tree_view_get_selection(GTK_TREE_VIEW(ws.list[1]));
+	if(!gtk_tree_selection_get_selected(sel,&model,&iter))
+	{
+		messagebox("get error");
+		return;
+	}
+	gtk_tree_model_get(model,&iter,0,&str[0],1,&str[1],2,&gin[0],3,&gin[1],-1);
+	memset(ch,0,sizeof(ch));
+	snprintf(ch,sizeof(ch),"%s",str[1]);
+	i=strlen(ch);
+	for(j=0;j<8;j++)
+	{
+		if(memcmp(ch,sl[j].ch,i)==0)//find it
+		{
+			memset((void*)&sl[j],0,sizeof(sl[j]));//clear			
+			gtk_list_store_remove(GTK_LIST_STORE(model),&iter);
+			break;
+		}
+	}
+	//snprintf(ch,sizeof(ch),"%s %s %d %d",str[0],str[1],gin[0],gin[1]);
+	g_free(str[0]);g_free(str[1]);
+}//}}}
+//{{{ int check_lock(char *c)
+int check_lock(char *c)
+{
+	GtkTreeIter iter;
+	GtkListStore *store;
+	int i,j,k,l,len;
+	char c1[20],c2[100];
+	char *gc;
+	len=strlen(c);
+	if(len>40 || len<=0)
+	{g_print("impossible!\n");return 1;}
+	for(i=0;i<8;i++)
+	{
+		if(memcmp(c,sl[i].ch,len)==0)
+		{
+			messagebox("你当前要锁定的地址早已加入到锁定列表中");
+			return 1;
+		}
+	}
+	memset(c1,0,20);
+	gc=(char*)gtk_entry_get_text(GTK_ENTRY(ws.entry[3]));
+	i=strlen(gc);
+	if(i>20)
+	{g_print("error\n");return 1;}
+	memcpy(c1,gc,i);
+	j=atoi(c1);
+	if(j<0)
+	{g_print("error1\n");return 1;}
+	memset(c1,0,20);
+	gc=(char*)gtk_entry_get_text(GTK_ENTRY(ws.entry[4]));
+	i=strlen(gc);
+	if(i>20)
+	{g_print("error11\n");return 1;}
+	memcpy(c1,gc,i);
+	k=atoi(c1);
+	if(k<0)
+	{g_print("error122\n");return 1;}
+	memset(c1,0,20);
+	gc=(char*)gtk_entry_get_text(GTK_ENTRY(ws.entry[1]));
+	i=strlen(gc);
+	if(i>20)
+	{g_print("error1144\n");return 1;}
+	memcpy(c1,gc,i);
+	l=0;
+	for(i=0;i<8;i++)
+	{
+		if(sl[i].ch[0]==0)//
+		{
+			l=1;
+			memcpy(sl[i].ch,c,strlen(c));
+			sl[i].add.maxd=k;
+			sl[i].add.mind=j;
+			gc=ws.g_addr[0];
+			gc+=idx*sizeof(int);//定位到地址集中的目标地址的偏移
+			memcpy((void*)&(sl[i].add.ksa),(void*)gc,sizeof(struct KVAR_SAD));
+			break;
+		}
+	}
+	if(l!=1)
+	{
+		messagebox("锁定的目标地址最多8个");
+		return 1;
+	}
+	store = GTK_LIST_STORE(gtk_tree_view_get_model
+			(GTK_TREE_VIEW(ws.list[1])));
+	gtk_list_store_append(store,&iter);
+	gtk_list_store_set(store,&iter,0,c1,1,c,2,j,3,k,-1);
+	return 0;
+}//}}}
+//{{{ void on_lock(GtkWidget *widget,gpointer gp)
+void on_lock(GtkWidget *widget,gpointer gp)
+{
+	int i,j,k,fd;
+	char ch[40],*c,*lb;
+	struct KVAR_AM *k_am;
+	unsigned int u[2],v,z;
+	unsigned short us[2];
+	if(ws.dseg>ws.bseg)
+	{
+		u[0]=ws.bseg;us[0]=0;
+		u[1]=ws.dseg;us[1]=1;
+	}
+	else
+	{
+		u[0]=ws.dseg;us[0]=1;
+		u[1]=ws.bseg;us[1]=0;
+	}
+	memset(ws.g_ch,0,buf_size);
+	k_am=(struct KVAR_AM *)ws.g_ch;
+	j=0;
+	lb=(char*)gtk_button_get_label(GTK_BUTTON(ws.bnt[8]));
+	if(strncmp(lb,"锁    定",strlen(lb))==0)
+	{
+		gtk_button_set_label(GTK_BUTTON(ws.bnt[8]),"取消锁定");
+		for(i=0;i<8;i++)
+		{
+			v=0;
+			if(sl[i].ch[0]!=0)
+			{
+				if(tonum(sl[i].ch,&v))
+					goto err_a01;
+				z=sl[i].add.ksa.s_b.pbit*4096;
+				z+=sl[i].add.ksa.off;
+				if(v>u[1])
+					z+=u[1];
+				else
+					z+=u[0];
+				if(z==v)
+				{
+					memcpy((void*)&(k_am->vadd[j]),(void*)&(sl[i].add),sizeof(struct KVAR_ADDR));
+					j++;
+				}
+				else
+				{
+					memset(ch,0,sizeof(ch));
+					snprintf(ch,sizeof(ch),"org:0x%lx  calc:0x%lx",v,z);
+					messagebox(ch);
+					break;
+				}
+			}
+		}
+		k_am->sync=0;
+		k_am->end0=0;
+		k_am->cmd=3;
+		k_am->pid=ws.pid;
+		fd=open(drv_name,O_RDWR);
+		if(fd<0)
+		{
+			messagebox("目标模块连接失败");
+			return;
+		}
+		i=write(fd,ws.g_ch,buf_size);//发送命令
+		close(fd);
+		return;
+	}
+	else
+	{
+		gtk_button_set_label(GTK_BUTTON(ws.bnt[8]),"锁    定");
+		k_am->sync=0;
+		k_am->end0=1;
+		k_am->cmd=3;
+		fd=open(drv_name,O_RDWR);
+		if(fd<0)
+		{
+			messagebox("目标模块连接失败");
+			return;
+		}
+		i=write(fd,ws.g_ch,buf_size);//发送命令
+		close(fd);
+		return;
+	}
+//锁定操作不用启动线程，直接发送命令即可。
+	return;
+err_a01:
+	messagbox("error");
+	return;
+}//}}}
+//{{{ int tonum(char *c,unsigned int *ui)
+int tonum(char *c,unsigned int *ui)
+{
+	int i,j,k;
+	unsigned u;
+	j=strlen(c);
+	if(j>10)
+		return 1;
+	if(c[0]!='0' || c[1]!='x')
+		return 1;
+	u=0;
+	for(i=2;i<j;i++)
+	{
+		k=toupper(c[i]);
+		if(k>=0x30 && k<=0x39)
+		{
+			u*=0x10;
+			u+=k;u-=0x30;
+		}
+		else
+		{
+			if(k>='A' && k<='F')
+			{
+				u*=0x10;
+				u+=k;u-=0x37;
+			}
+			else
+				return 1;
+		}
+	}
+	*ui=u;
+	return 0;
+}//}}}
 
 
 
